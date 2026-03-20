@@ -1,5 +1,5 @@
 # UEFI MS CA 2011 Expiry / Secure Boot Audit
-**Status:** Active | **Deadline:** červen–říjen 2026
+**Status:** Active
 
 ## Kontext
 
