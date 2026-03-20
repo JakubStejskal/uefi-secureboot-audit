@@ -27,6 +27,7 @@ Specialist on Enterprise Infrastructure & UEFI Security
 - `Inventory-SecureBootVMs.ps1` — inventura VM Secure Boot nastavení
 - `Check-SecureBoot-OneView.ps1` — OV discovery → iLO SSO → optional reset
 - `hpe-secureboot-audit-v2.sh` — Bash: SSO fix, iLO 5/6/7 cert parsing, --filter-name, --reset/--dry-run, CSV output
+- `list-ilo5-uefi-certs.py` — Python: výpis UEFI `db`/`dbDefault` a `KEK`/`KEKDefault` certifikátů přes iLO5 Redfish
 
 ## Technické detaily
 
@@ -41,3 +42,41 @@ Po resetu nutný cold reboot!
 - `SecureBootDatabases` endpoint: iLO 6/Gen11+ nebo iLO 5 s dostatečně novým ROM
 - iLO 5 (starší): SSO přes `SSOToken` jako `X-Auth-Token` header (ne LoginToken)
 - `-ResponseHeadersVariable`: pouze PowerShell 7+; v PS 5.1 použít `$resp.Headers['X-Auth-Token']`
+
+## Použití: výpis UEFI CA / KEK přes iLO5
+
+Výchozí dotazované databáze:
+- `KEK`
+- `KEKDefault`
+- `db`
+- `dbDefault`
+
+Příklad:
+
+```bash
+export ILO_PASSWORD='tajneheslo'
+python3 ./list-ilo5-uefi-certs.py \
+  --host 10.10.10.25 \
+  --user Administrator
+```
+
+Více iLO najednou:
+
+```bash
+python3 ./list-ilo5-uefi-certs.py \
+  --hosts-file ./ilo-hosts.txt \
+  --user Administrator \
+  --csv ./uefi-certs.csv
+```
+
+JSON výstup:
+
+```bash
+python3 ./list-ilo5-uefi-certs.py \
+  --host ilo-gen10-01 \
+  --user Administrator \
+  --json
+```
+
+Poznámka:
+- Pokud iLO5/ROM neexponuje `SecureBootDatabases`, skript vrátí stav `unsupported`. To je očekávané chování na části Gen10 serverů se starším firmware/ROM.
