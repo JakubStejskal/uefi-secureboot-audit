@@ -642,6 +642,7 @@ main() {
   if [[ -n "$SERVERS_FILE" ]]; then
     log "Loading servers from file: $SERVERS_FILE"
     while IFS= read -r line || [[ -n "$line" ]]; do
+      line="${line%$'\r'}"   # strip Windows CR (CRLF files)
       [[ -z "$line" || "$line" =~ ^# ]] && continue
       if [[ "$line" == *"|"* ]]; then
         SERVER_LINES+=("$line")
