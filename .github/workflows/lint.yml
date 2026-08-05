@@ -1,0 +1,44 @@
+name: Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  psscriptanalyzer:
+    name: PSScriptAnalyzer
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install PSScriptAnalyzer
+        shell: pwsh
+        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+
+      - name: Parse check
+        shell: pwsh
+        run: |
+          $failed = $false
+          Get-ChildItem -Path ./scripts -Filter *.ps1 | ForEach-Object {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile(
+                  $_.FullName, [ref]$null, [ref]$errors) | Out-Null
+              if ($errors) {
+                  $failed = $true
+                  Write-Host "::error file=$($_.Name)::Parse errors"
+                  $errors | ForEach-Object { Write-Host "  line $($_.Extent.StartLineNumber): $($_.Message)" }
+              } else {
+                  Write-Host "OK  $($_.Name)"
+              }
+          }
+          if ($failed) { exit 1 }
+
+      - name: Analyze
+        shell: pwsh
+        run: |
+          $r = Invoke-ScriptAnalyzer -Path ./scripts -Recurse -Severity Error,Warning `
+                 -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions
+          if ($r) { $r | Format-Table -AutoSize | Out-String | Write-Host }
+          if ($r | Where-Object Severity -eq 'Error') { exit 1 }

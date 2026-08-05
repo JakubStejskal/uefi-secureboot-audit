@@ -1,0 +1,20 @@
+# Audit output
+*.csv
+!examples/*.csv
+*.json
+!.vscode/*.json
+secureboot-backup/
+*.log
+
+# Credentials — never commit
+*.cred
+*.pfx
+*.key
+ilo_list.txt
+ilo_hosts.txt
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

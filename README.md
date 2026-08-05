@@ -1,227 +1,251 @@
-# UEFI MS CA 2011 Expiry / Secure Boot Audit
-**Status:** Active
+# UEFI Secure Boot Audit — Microsoft CA 2011 → 2023
 
-## Kontext
+Audit and remediation tooling for the Microsoft Secure Boot certificate expiration, covering **HPE ProLiant Gen10 / Gen10 Plus / Gen11 / Gen12**, **VMware ESXi hosts**, and **virtual machines running on ESXi**.
 
-Audit a náprava expirace Microsoft UEFI CA 2011 certifikátů v HPE fleet (Secure Boot).  
-KBs: **KB423893**, **KB423919**, **KB421593**, **KB424429**  
-Zdroje: Broadcom TAM session 5. 2. 2026, HPE TAM Slack (Scott Wiginton, derek.lin2)
+> **Status as of 2026-08-04:** two of the three 2011 CAs have already expired. Nothing broke, and nothing was supposed to. The last live deadline is **19 October 2026**.
 
----
-
-## Skripty
-
-| Soubor | Jazyk | Popis |
-|--------|-------|-------|
-| `hpe-secureboot-audit-v2.sh` | Bash | Hlavní auditní script — OneView discovery nebo static file, iLO 5/6/7, SSO, CSV report, optional reset |
-| `Check-SecureBoot-OneView.ps1` | PowerShell | OneView → SSO → iLO Redfish audit + optional reset, PS 5.1 i PS 7+ |
-| `list-ilo5-uefi-certs.py` | Python | Výpis UEFI `db`/`KEK` certifikátů přes iLO5 Redfish (read-only) |
-| `Check-SecureBootiLO.ps1` | PowerShell | Přímá kontrola Secure Boot přes iLO credentials (bez OneView), PS 5.1 i PS 7+ |
-| `Inventory-SecureBootVMs.ps1` | PowerShell | Inventura VM Secure Boot nastavení přes PowerCLI/vCenter |
+📘 **[Full runbook →](docs/runbook.md)** · 📋 **[Certificate reference →](docs/certificate-reference.md)**
 
 ---
 
-## Použití: hpe-secureboot-audit-v2.sh
+## The 60-second version
 
-```bash
-# Inventura celého fleetu přes OneView (SSO, bez iLO hesel)
-./hpe-secureboot-audit-v2.sh --ov-host ov.lab.local
+**Expiration is not revocation.** UEFI firmware validates an image by checking membership in `db` and absence from `dbx` — it does **not** check the certificate's validity period (UEFI 2.10 §32). Microsoft confirmed this explicitly on 2026-06-24 and stated it has **no plan to revoke** the 2011 UEFI CA.
 
-# Filtrovat pouze DL380 servery
-./hpe-secureboot-audit-v2.sh --ov-host ov.lab.local --filter-name DL380
+So what boots today keeps booting. Two things actually matter:
 
-# Dry-run — zobraz co by bylo resetováno, ale neprováděj
-./hpe-secureboot-audit-v2.sh --ov-host ov.lab.local --reset --dry-run
+1. **Servicing is severed.** With `Microsoft Corporation KEK CA 2011` expired, any machine without `KEK 2K CA 2023` can no longer receive **any** future `db` or `dbx` update — including revocations for boot-level CVEs.
+2. **A 2023-only binary meeting a 2011-only `db` fails to boot.** This is the real-world failure mode, and it arrives via a patched golden image, a re-spun Linux shim, or a replacement add-in card — not on the expiry date itself.
 
-# Skutečný reset (kde chybí 2023 certy)
-./hpe-secureboot-audit-v2.sh --ov-host ov.lab.local --reset
-
-# Bez OneView — statický seznam iLO IP adres, manuální credentials
-./hpe-secureboot-audit-v2.sh --servers ilo_list.txt --auth manual \
-    --ilo-user Administrator --csv report.csv
-
-# Verbose debug výstup
-./hpe-secureboot-audit-v2.sh --ov-host ov.lab.local --verbose
-```
-
-**Formát `ilo_list.txt`:**
-```
-# komentáře ignorovány
-10.3.18.50
-server-name|10.3.18.51
-server-name|10.3.18.52|server-hw-uuid
-```
-
-**CSV výstup obsahuje:** ServerName, iLO_IP, iLO_Generation, AuthSource, SecureBootEnabled, SecureBootMode, db_Has2023Cert, KEK_Has2023Cert, db_Subjects, KEK_Subjects, Error
+The documented at-scale outage so far is **Citrix MCS** ([CTX696696](https://support.citrix.com/external/article/CTX696696/vda-boot-failure-no-boot-media-after-mcs.html)): MCS replaces the OS disk but not the VM's NVRAM, so a master image patched to a 2023-signed bootloader clones onto VMs that cannot boot it. Check every golden image, template, linked-clone and Packer pipeline you run for the same pattern.
 
 ---
 
-## Použití: Check-SecureBoot-OneView.ps1
+## Timeline
+
+| Date | Certificate | Status |
+|---|---|---|
+| 2026-06-24 | Microsoft Corporation KEK CA 2011 | **Expired** |
+| 2026-06-27 | Microsoft Corporation UEFI CA 2011 | **Expired** |
+| **2026-10-19** | **Microsoft Windows Production PCA 2011** | **Upcoming** |
+
+---
+
+## HPE generation matrix
+
+HPE delivers the 2023 certificates **only through System ROM**. There is no separate certificate utility, and iLO firmware is not the delivery vehicle — advisory revision 2 removed iLO 5 from the affected-products list for exactly this reason.
+
+| Generation | Min. System ROM | Key reset | iLO certificate read-out |
+|---|---|---|---|
+| **Gen10** (iLO 5) | Intel **3.62** · AMD **3.70**<br>*DL20 / ML30 / m750: 3.72* | Required | ❌ **Not possible** |
+| **Gen10 Plus** (iLO 5) | Intel **2.30** · AMD **3.50** | Required | ❌ **Not possible** |
+| **Gen11** (iLO 6 ≥ 1.10) | Intel **2.42** · AMD **2.30** | Required | ✅ Full inventory |
+| **Gen12** (iLO 7 ≥ 1.11) | — (factory) | **Not required** | ✅ Full inventory |
+| Gen9 (iLO 4) | *none exists* | — | ❌ No API |
+
+Source: [HPE Customer Advisory a00156355en_us](https://support.hpe.com/hpesc/public/docDisplay?docId=a00156355en_us&docLocale=en_US), rev. 5 (2026-07-02). In practice **any 2026 SPP** satisfies the Gen10 / Gen10 Plus / Gen11 baselines.
+
+### The iLO 5 limitation is real and permanent
+
+On Gen10 and Gen10 Plus you **cannot enumerate Secure Boot certificates out-of-band at all**. This is a property of iLO 5, not a firmware-version problem and not a configuration issue:
+
+- The iLO 5 Redfish resource map exposes exactly one Secure Boot URI — `/redfish/v1/Systems/1/SecureBoot` — for **every** firmware release including the latest (v3.19).
+- `SecureBootDatabases` does not appear anywhere in the iLO 5 changelog or API reference. It was introduced in **iLO 6 v1.10**.
+
+What you get on iLO 5 is `SecureBootEnable`, `SecureBootCurrentBoot`, `SecureBootMode`, and the `ResetKeys` action. Certificate state must be inferred from the System ROM version, or verified out of band:
+
+```
+# Embedded UEFI Shell
+secboot -l KEK
+secboot -l db
+```
+
+`HPE-SecureBootAudit.ps1` handles this by reporting `ROM_OK_CERTS_UNKNOWN` rather than claiming a compliance it cannot prove.
+
+### A ROM update alone does nothing
+
+Flashing the System ROM refreshes only the **read-only `*Default` databases**. The live NVRAM variables are untouched — HPE states it plainly: *"Defaults are not used at runtime."*
+
+The new keys reach the live databases only via an explicit **"Reset All Keys to Platform Defaults"**, which:
+
+- **deletes every customer-enrolled key** (custom PK, MOK, OS-vendor certificates), and
+- **turns Secure Boot off**, requiring a separate step to turn it back on.
+
+Budget **three reboots** per server: ROM flash → key reset → re-enable Secure Boot.
+
+---
+
+## VMware
+
+### Hosts — not the exposure
+
+Broadcom [KB 434297](https://knowledge.broadcom.com/external/article/434297/secure-boot-certificate-expirations-guid.html): *"There is no impact on Secure Boot-enabled ESX hosts, and no immediate action is necessary."* That held — no ESXi boot failures were reported after 2026-06-27.
+
+Multi-signed bootloaders (2011 + 2023) shipped in:
+
+| Release | Date | Build |
+|---|---|---|
+| ESX 9.1.0.0 | 2026-05-12 | `25370933` |
+| ESXi 8.0 U3j (P09) | 2026-05-27 | `25429389` |
+
+vSphere 7.x will never get one (EOGS 2025-10-02).
+
+> ⚠️ **The one action that genuinely bricks an ESXi host** is removing `Microsoft Corporation UEFI CA 2011` from `db`, or pushing it to `dbx`. That CA validates the firmware of RAID controllers, NICs and HBAs. Broadcom: *"Revoking this certificate without fully understanding its usage may result in an unbootable system."*
+
+> ⚠️ **Before any firmware work on a TPM-enabled host**, save the recovery key **off-host**:
+> ```
+> esxcli system settings encryption recovery list
+> ```
+> A firmware flash that resets Secure Boot causes a PSOD, and Broadcom is explicit that configuration backups alone cannot recover it.
+
+Also note: `secureBoot.py -c` is **not** a readiness test. It validates VIB signatures and acceptance levels; Broadcom states *"This script does not check for an up-to-date bootloader."* It tells you nothing about which CA signed your bootloader or what is in the firmware `db`.
+
+### Virtual machines — this is the exposure
+
+A VM's Secure Boot variables live in its `.nvram` file, seeded **once** at NVRAM creation from the host's EFI image. **Patching the host does not re-seed existing VMs. Neither does a hardware-version upgrade.**
+
+| VM origin | PK | KEK / db | Risk |
+|---|---|---|---|
+| ESXi < 8.0 U2, or HW 13 | `VMW.NULLPK` | 2011 only | **HIGH** |
+| ESXi 8.0 U2 – U3i, HW 14+ | `VMW.NULLPK` | 2023 present | **MEDIUM** — can never be updated again |
+| Host 8.0 U3j+, no vTPM | SilentPK adds it | 2023 | **LOW** — power-cycle and done |
+| Host U3j+, vTPM, non-Windows | `uefi.secureBoot.PK.resetOnce` | 2023 | MEDIUM |
+| Host U3j+, vTPM, Windows | — | — | MEDIUM — **Broadcom says wait** for the capsule solution |
+| ESX 9.x | Windows OEM Devices PK | 2023 | **LOW** |
+
+Hardware version thresholds: **14+** is a hard requirement for any PK update; **20+** is the practical recommendation for enough EFI variable storage to absorb the enlarged DBX (below it, expect Event 1796 / `0x80070008`).
+
+> ⚠️ **The VMware PK is not expired — it is NULL.** `VMW.NULLPK` is a placeholder with a NULL signature: no X.509, therefore no expiry date. The expired *"VMware Certificate"* (Dec 2019) that circulates in blog posts sits in `db` and is inert. What NULL PK actually does is block KEK update authorisation, surfacing in Windows as **Event ID 1803**.
+
+> ⚠️ **Do not delete or rename `.nvram`.** Broadcom withdrew that guidance — KB 423919 replaced KB 421593 explicitly *"to avoid suggestions of deleting NVRAM, as that behavior can lead to unexpected corruptions of the associated VM."* On a vTPM VM it destroys the vTPM state, and with it the BitLocker / LUKS keys, irreversibly.
+
+---
+
+## Scripts
+
+All scripts run on Windows PowerShell 5.1 and PowerShell 7+.
+
+| Script | Mode | Purpose |
+|---|---|---|
+| [`scripts/HPE-SecureBootAudit.ps1`](scripts/HPE-SecureBootAudit.ps1) | read-only | Fleet audit via iLO Redfish, Gen10 → Gen12, with graceful degradation on iLO 5 |
+| [`scripts/HPE-SecureBootRemediate.ps1`](scripts/HPE-SecureBootRemediate.ps1) | **destructive** | Staged key reset with preflight guards and pre-change key export |
+| [`scripts/VMware-SecureBootAudit.ps1`](scripts/VMware-SecureBootAudit.ps1) | read-only | ESXi host and VM risk classification, optional in-guest verification |
+
+### Audit an HPE fleet
 
 ```powershell
-# Inventura všech serverů
 $cred = Get-Credential
-.\Check-SecureBoot-OneView.ps1 -OneViewAddress 'ov.lab.local' -OVCredential $cred
 
-# Export do CSV
-.\Check-SecureBoot-OneView.ps1 -OneViewAddress 'ov.lab.local' -OVCredential $cred `
-    -ExportCsv 'C:\sb_report.csv'
+# One or more hosts
+.\scripts\HPE-SecureBootAudit.ps1 -ILOHost ilo-esx01,ilo-esx02 -Credential $cred -SkipCertificateCheck |
+    Format-Table ILOHost,Model,Generation,BiosVersion,RomStatus,CertInventory,Verdict -AutoSize
 
-# Filtrovat jen DL360
-.\Check-SecureBoot-OneView.ps1 -OneViewAddress 'ov.lab.local' -OVCredential $cred `
-    -ServerFilter 'DL360*'
-
-# Dry-run reset
-.\Check-SecureBoot-OneView.ps1 -OneViewAddress 'ov.lab.local' -OVCredential $cred `
-    -ResetKeysOnMissing -WhatIf
-
-# Skutečný reset (s potvrzením pro každý server)
-.\Check-SecureBoot-OneView.ps1 -OneViewAddress 'ov.lab.local' -OVCredential $cred `
-    -ResetKeysOnMissing
+# From a CSV (see examples/fleet.csv)
+.\scripts\HPE-SecureBootAudit.ps1 -InputCsv .\examples\fleet.csv -Credential $cred `
+    -SkipCertificateCheck -OutputCsv .\hpe-audit.csv -OutputJson .\hpe-audit.json
 ```
 
-**Požadavky:**
+**Verdicts:**
+
+| Verdict | Meaning |
+|---|---|
+| `COMPLIANT` | All four 2023 certificates present, or Gen12 |
+| `NEEDS_KEY_RESET` | ROM meets baseline, live databases still lack 2023 certs |
+| `NEEDS_ROM_AND_RESET` | System ROM below the advisory baseline |
+| `ROM_OK_CERTS_UNKNOWN` | iLO 5 — ROM is fine, certificate state unverifiable out-of-band |
+| `NOT_SUPPORTED` | Gen9 — no firmware path exists |
+| `ERROR` | Unreachable, auth failure, or unexpected response |
+
+### Remediate
+
+Three stages, each requiring a reboot in between.
+
 ```powershell
-# Nainstalovat aktuální HPEOneView modul
-Find-Module HPEOneView.* | Sort-Object Version -Desc | Select -First 1 | Install-Module
+# Always dry-run first
+.\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage ResetKeys -SkipCertificateCheck -WhatIf
+
+# 1. Reset keys (deletes enrolled keys, disables Secure Boot) → reboot
+.\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage ResetKeys -SkipCertificateCheck
+
+# 2. Re-enable Secure Boot → reboot
+.\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage EnableSecureBoot -SkipCertificateCheck
+
+# 3. Verify
+.\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage Verify -SkipCertificateCheck
 ```
 
-**Kompatibilita:**
-- PS 5.1 — automaticky používá `TrustAllCertsPolicy` (iLO self-signed cert)
-- PS 7+ — používá nativní `-SkipCertificateCheck`
+Preflight **blocks** the reset when the System ROM is below baseline (a reset would restore 2011-only defaults — a silent regression), and on Gen12 and Gen9 where it is pointless or harmful. `-Force` overrides; the block exists for a reason.
+
+Before the reset, all readable certificates are exported to `.\secureboot-backup\<host>_<timestamp>\` as PEM plus a JSON manifest. On iLO 5, where no read-out is possible, the script warns you to export manually from RBSU.
+
+### Audit VMware
+
+```powershell
+Connect-VIServer vcsa01
+
+.\scripts\VMware-SecureBootAudit.ps1 -OutputCsv .\vmware-audit.csv |
+    Where-Object Risk -in 'HIGH','MEDIUM' |
+    Format-Table Name,HWVersion,vTPM,HostBuild,Risk,Action -AutoSize
+
+# With in-guest verification (the only way to actually read NVRAM contents)
+.\scripts\VMware-SecureBootAudit.ps1 -IncludeGuestCheck -GuestCredential (Get-Credential)
+```
 
 ---
 
-## Použití: Check-SecureBootiLO.ps1
+## Recommended rollout order
 
-```powershell
-# Jeden server — přímé iLO credentials
-$cred = Get-Credential
-.\Check-SecureBootiLO.ps1 -IloHost '10.3.18.50' -IloCredential $cred
+1. **Audit both sides.** Classify by verdict and risk before changing anything.
+2. **Escrow the recovery material.** ESXi TPM recovery keys off-host; BitLocker recovery passwords out of the VMs.
+3. **vCenter → ESXi hosts** to 8.0 U3j (`25429389`) or ESX 9.1 (`25370933`).
+4. **HPE System ROM** (any 2026 SPP) in batches.
+5. **Key reset + re-enable Secure Boot** in a maintenance window, three reboots per server.
+6. **Power-cycle VMs** so SilentPK applies the PK.
+7. **Windows in-guest servicing** — set `AvailableUpdates` to `0x5944`, run the scheduled task, confirm Event **1808**.
+8. **Re-audit** and close out before **2026-10-19**.
 
-# Více serverů najednou
-.\Check-SecureBootiLO.ps1 -IloHost '10.3.18.50','10.3.18.51','10.3.18.52' -IloCredential $cred
-
-# Ze souboru (formát: name|ip nebo jen ip)
-.\Check-SecureBootiLO.ps1 -HostsFile 'ilo_hosts.txt' -IloCredential $cred
-
-# Export do CSV
-.\Check-SecureBootiLO.ps1 -HostsFile 'ilo_hosts.txt' -IloCredential $cred `
-    -ExportCsv 'C:\sb_direct.csv'
-
-# Dry-run reset (zobraz co by bylo resetováno)
-.\Check-SecureBootiLO.ps1 -IloHost '10.3.18.50' -IloCredential $cred `
-    -ResetKeysOnMissing -WhatIf
-
-# Skutečný reset
-.\Check-SecureBootiLO.ps1 -IloHost '10.3.18.50' -IloCredential $cred `
-    -ResetKeysOnMissing
-```
-
-**Formát `ilo_hosts.txt`:**
-```
-# komentáře ignorovány
-10.3.18.50
-server-name|10.3.18.51
-```
-
-**Poznámky:**
-- Nevyžaduje OneView — vhodné pro standalone servery nebo prostředí bez OV
-- Detekuje KEK_2023 a DB_2023 certifikáty
-- PS 5.1 kompatibilní (TrustAllCertsPolicy)
-- Session management: POST SessionService → DELETE po dokončení
+Windows in-guest details, event IDs and Linux guidance are in the [runbook](docs/runbook.md).
 
 ---
 
-## Použití: list-ilo5-uefi-certs.py (read-only)
+## Before production
 
-```bash
-# Jeden host — text výstup
-export ILO_PASSWORD='heslo'
-python3 list-ilo5-uefi-certs.py --host 10.3.18.50 --user Administrator
+- **Verify the ROM baselines against the current advisory revision.** HPE revised a00156355en_us five times between January and July 2026. The values here are from rev. 5.
+- **Test the remediation script on a lab server first.** Redfish calls have not been executed against live hardware from this repository; the logic is unit-tested, the wire calls are not.
+- **iLO 7 / Gen12 `SecureBootDatabases` support is inferred**, not confirmed — iLO 7 is a superset of iLO 6, but the iLO 7 changelog does not list it explicitly. Confirm on one live Gen12.
+- **The PCR indices ESXi seals its configuration against are unpublished.** Whether adding 2023 certificates to firmware `db` can break config unsealing on specific hardware is therefore untested. This is the highest-value lab test before a fleet rollout.
 
-# Hromadně ze souboru → CSV
-python3 list-ilo5-uefi-certs.py \
-  --hosts-file ilo-hosts.txt --user Administrator --csv uefi-certs.csv
+## Known gaps upstream
 
-# Pouze KEK a db databáze, JSON výstup
-python3 list-ilo5-uefi-certs.py \
-  --host ilo-gen10-01 --user Administrator \
-  --databases KEK,db --json | jq '.[] | .databases[] | .certificates[] | .subject_cn'
-```
-
-> Pokud iLO5/ROM neexponuje `SecureBootDatabases`, skript vrátí stav `unsupported` —
-> očekávané chování na části Gen10 serverů se starším ROM.
+- Broadcom's promised **PowerCLI sample script** and the **capsule-based vTPM solution** (both announced in KB 423893) had not shipped as of 2026-08-04.
+- **vLCM and hardware support managers have no compliance check** for Secure Boot certificates. Cluster compliance can read fully green while every host still has a 2011-only `db`.
 
 ---
 
-## Použití: Inventory-SecureBootVMs.ps1
+## Legacy scripts
 
-```powershell
-# Inventura všech VM ve vCenter
-$vcCred = Get-Credential
-.\Inventory-SecureBootVMs.ps1 -VCenterServer 'vcenter.lab.local' -Credential $vcCred
+The previous OneView-based tooling is preserved under [`legacy/`](legacy/), including `hpe-secureboot-audit-v2.sh` with OneView SSO discovery — a capability the v2 scripts do not yet have. The original Czech README is at [`legacy/README.cs.md`](legacy/README.cs.md).
 
-# Filtrovat jen konkrétní cluster
-.\Inventory-SecureBootVMs.ps1 -VCenterServer 'vcenter.lab.local' -Credential $vcCred `
-    -Cluster 'Tanzu-Cluster-01'
-
-# Filtrovat jen konkrétní datacenter
-.\Inventory-SecureBootVMs.ps1 -VCenterServer 'vcenter.lab.local' -Credential $vcCred `
-    -Datacenter 'Prague-DC'
-
-# Filtrovat VM podle jména (wildcard)
-.\Inventory-SecureBootVMs.ps1 -VCenterServer 'vcenter.lab.local' -Credential $vcCred `
-    -VMFilter 'tkc-*'
-
-# Zobrazit pouze VM kde Secure Boot NENÍ zapnuto
-.\Inventory-SecureBootVMs.ps1 -VCenterServer 'vcenter.lab.local' -Credential $vcCred `
-    -ShowOnlyNoSecureBoot
-
-# Export do CSV
-.\Inventory-SecureBootVMs.ps1 -VCenterServer 'vcenter.lab.local' -Credential $vcCred `
-    -ExportCsv 'C:\vm_sb_inventory.csv'
-```
-
-**Požadavky:**
-```powershell
-Install-Module VMware.PowerCLI
-```
-
-**Co script kontroluje:**
-- Firmware typ (EFI vs BIOS)
-- `EfiSecureBootEnabled` flag
-- Hardware version (vmx-XX)
-- Guest OS typ
-- **Souhrn:** počty EFI+SB ON / EFI+SB OFF / BIOS (bez SB)
+⚠️ The legacy scripts carry **outdated ROM baselines** (Gen10 listed as 3.40 rather than 3.62) and state that iLO 5 exposes `SecureBootDatabases` "with a sufficiently new ROM", which is not correct. Use them for OneView discovery only; take the certificate facts from this README.
 
 ---
 
-## Technické detaily
+## Sources
 
-### Redfish Secure Boot Reset
-```
-POST /redfish/v1/Systems/1/SecureBoot/Actions/SecureBoot.ResetKeys/
-Body: {"ResetKeysType":"ResetAllKeysToDefault"}
-```
-**Po resetu nutný cold reboot!**
+**HPE** — [a00156355en_us](https://support.hpe.com/hpesc/public/docDisplay?docId=a00156355en_us&docLocale=en_US) (advisory, rev. 5) · [a00159017en_us](https://support.hpe.com/hpesc/public/docDisplay?docId=a00159017en_us&docLocale=en_US) (Azure Stack Hub, includes BitLocker steps) · [Secure Boot Databases](https://servermanagementportal.ext.hpe.com/docs/concepts/securebootdatabases)
 
-### iLO generace a omezení
+**Broadcom** — [KB 423893](https://knowledge.broadcom.com/external/article/423893/secure-boot-certificate-expirations-and.html) (VMs) · [KB 423919](https://knowledge.broadcom.com/external/article/423919/manual-update-of-secure-boot-variables-i.html) (manual vUEFI enrolment) · [KB 434297](https://knowledge.broadcom.com/external/article/434297/secure-boot-certificate-expirations-guid.html) (hosts) · [KB 316424](https://knowledge.broadcom.com/external/article/316424/how-to-prepare-a-tpm-enabled-esxi-host-f.html) (TPM recovery)
 
-| iLO | SecureBootDatabases | SSO metoda |
-|-----|---------------------|------------|
-| iLO 5 (Gen10) | Pouze s dostatečně novým ROM | `SSOToken` přímo jako `X-Auth-Token` (LoginToken POST nepodporován) |
-| iLO 6 (Gen11) | ✅ Plná podpora | LoginToken session POST nebo přímý SSOToken |
-| iLO 7 (Gen12) | ✅ Plná podpora | LoginToken session POST nebo přímý SSOToken |
+**Microsoft** — [KB5062710](https://support.microsoft.com/en-us/topic/windows-secure-boot-certificate-expiration-and-ca-updates-7ff40d33-95dc-4c3c-8725-a9b95457578e) · [KB5068202](https://support.microsoft.com/en-us/topic/registry-key-updates-for-secure-boot-windows-devices-with-it-managed-updates-a7be69c9-4634-42e1-9ca1-df06f43f360d) (registry) · [Troubleshooting guide](https://support.microsoft.com/en-us/servicing/os/secure-boot/2026/03/secure-boot-troubleshooting-guide) · [Expiration is not revocation](https://techcommunity.microsoft.com/blog/linuxandopensourceblog/what-it-teams-need-to-know-about-linux-secure-boot-certificates-expiring-in-2026/4530725)
 
-### Min. verze BIOS pro Reset Keys
-| Generace | Min. ROM verze |
-|----------|----------------|
-| Gen10 (DL/ML) | 3.40_01-16-2025 + Reset Keys |
-| Gen10 Plus    | 2.30_01-16-2025 |
-| Gen11         | 2.42_12-06-2024 |
+**Other** — [Citrix CTX696696](https://support.citrix.com/external/article/CTX696696/vda-boot-failure-no-boot-media-after-mcs.html) · [Red Hat 7128933](https://access.redhat.com/articles/7128933) · [AlmaLinux](https://wiki.almalinux.org/documentation/secure-boot-2023-certificates.html)
 
-### PowerShell gotchas
-- `-SkipCertificateCheck` je pouze PS 6+ — v PS 5.1 nutná `TrustAllCertsPolicy` (viz skripty)
-- `-ResponseHeadersVariable` je pouze PS 7+ — v PS 5.1 použít `$resp.Headers['X-Auth-Token']`
-- `$host` je rezervovaná proměnná — vždy přejmenovat na `$iloHost` nebo podobně
+---
+
+## Licence & disclaimer
+
+[MIT](LICENSE). Provided **as-is, with no warranty of any kind**.
+
+This project is **not affiliated with, endorsed by, or supported by** HPE, Broadcom, VMware, Microsoft or Citrix. All product names and knowledge-base references are the property of their respective owners.
+
+Resetting Secure Boot keys and updating firmware carry a real risk of rendering a system unbootable and of triggering BitLocker or TPM recovery. You are responsible for validating these procedures in your own environment, on non-production hardware, before using them.
