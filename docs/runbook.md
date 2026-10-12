@@ -1,6 +1,6 @@
 # Runbook — Microsoft Secure Boot CA 2011 → 2023
 
-Operational procedures for HPE ProLiant Gen10 / Gen10 Plus / Gen11 / Gen12, VMware ESXi hosts, and virtual machines running on ESXi.
+Operational procedures for HPE ProLiant Gen11 / Gen12 (iLO 5 servers: see the manual procedure), VMware ESXi hosts, and virtual machines running on ESXi.
 
 State as of **2026-08-04**. See the [certificate reference](certificate-reference.md) for thumbprints and verification snippets.
 
@@ -60,7 +60,7 @@ This is the archetype: **not the expiry, but a 2023-only boot chain meeting a 20
 
 ### Delivery mechanism
 
-HPE delivers the 2023 certificates **only through System ROM**. There is no separate certificate utility, and iLO firmware is not the delivery vehicle — advisory revision 2 (2026-02-10) removed *"HPE Integrated Lights-Out 5 (iLO 5) for HPE Gen10 Servers"* from the affected-products list, which is the documentary confirmation.
+HPE delivers the 2023 certificates **only through System ROM**. There is no separate certificate utility, and iLO firmware is not the delivery vehicle.
 
 ### Minimum System ROM
 
@@ -68,28 +68,24 @@ Per [advisory a00156355en_us](https://support.hpe.com/hpesc/public/docDisplay?do
 
 | Generation | Intel | AMD | Exception |
 |---|---|---|---|
-| Gen10 | **3.62** | **3.70** | DL20 Gen10, ML30 Gen10, m750 → **3.72** |
-| Gen10 Plus | **2.30** | **3.50** | — |
 | Gen11 | **2.42** | **2.30** | — |
 | Gen12 | — | — | 2023 certificates included **and enabled** from the first factory BIOS |
 | Gen9 | *none exists* | | Last ROM P89 v3.30 (2023-09) contains no 2023 certificates |
 
 The published minimum is the version in which the **last** of the four certificates — `Microsoft Option ROM UEFI CA 2023` — landed. Earlier ROMs typically already carry the other three.
 
-In practice **any 2026 SPP** satisfies the Gen10 / Gen10 Plus / Gen11 baselines: bundle 2026.05.00.00 carries U30 3.66, U46 2.64 and U54 2.84.
+In practice **any 2026 SPP** satisfies the Gen11 baseline: bundle 2026.05.00.00 carries U54 2.84.
 
 ### iLO capability by generation
 
 | iLO | Servers | `/SecureBoot` | `SecureBoot.ResetKeys` | `SecureBootDatabases` |
 |---|---|---|---|---|
 | iLO 4 | Gen9 | ❌ | ❌ | ❌ |
-| iLO 5 | Gen10, Gen10 Plus | ✅ | ✅ | ❌ **never, at any firmware level** |
+| iLO 5 | iLO 5 servers | ✅ | ✅ (all keys only) | ❌ **never, at any firmware level** |
 | iLO 6 | Gen11 | ✅ | ✅ | ✅ since v1.10 |
 | iLO 7 | Gen12 | ✅ | ✅ | ✅ since v1.11 |
 
-**On Gen10 and Gen10 Plus you cannot enumerate Secure Boot certificates out-of-band at all.** The iLO 5 Redfish resource map exposes exactly one Secure Boot URI for every firmware release including the latest (v3.19), and `SecureBootDatabases` appears nowhere in the iLO 5 changelog or API reference.
-
-Verification on those generations must come from the Embedded UEFI Shell (`secboot -l KEK`, `secboot -l db`), from RBSU, or from inside the OS.
+iLO 5 servers are out of scope for the tooling — see [Servers with iLO 5](#servers-with-ilo-5-gen10--gen10-plus--manual-procedure).
 
 ### A ROM update alone changes nothing
 
@@ -101,7 +97,7 @@ New keys reach the live databases only via an explicit **"Reset All Keys to Plat
 
 > "**"Reset All Keys to Platform Defaults" is required to activate these digital certificates** after the minimum BIOS version that includes the digital certificates is installed."
 
-### Procedure — Gen10 / Gen10 Plus / Gen11
+### Procedure — Gen11
 
 Budget **three reboots** per server.
 
@@ -115,8 +111,7 @@ $cred = Get-Credential
 
 **2. Capture rollback state**
 
-- Gen11/Gen12: `GET` every `CertificateString` (the remediation script does this automatically)
-- Gen10/Gen10 Plus: RBSU → *Server Security → Secure Boot Settings → Advanced Secure Boot Options → Export all keys*
+- `GET` every `CertificateString` (the remediation script does this automatically)
 - Record the current ROM version and confirm downgrade is still permitted — Gen11 U54 2.30 is the first ROM supporting iLO 6 1.6.2, and HPE does not support downgrading below it afterwards
 
 **3. Protect the OS**
@@ -160,11 +155,28 @@ PATCH /redfish/v1/Systems/1/SecureBoot
 
 **7. Verify**
 
-- Gen11/Gen12: Redfish inventory — all four 2023 certificates
-- Gen10/Gen10 Plus: `secboot -l KEK` and `secboot -l db` in the Embedded UEFI Shell
+- Redfish inventory — all four 2023 certificates
 - ESXi: run `/sbin/auto-backup.sh` once the host is up, or the configuration is not re-sealed
 
 **8. Re-enrol custom keys** that step 5 destroyed.
+
+### Servers with iLO 5 (Gen10 / Gen10 Plus) — manual procedure
+
+Out of scope for `HPE-SecureBootAudit.ps1` and `HPE-SecureBootRemediate.ps1`, because in practice it cannot be done remotely:
+
+- **No audit.** The iLO 5 Redfish API exposes `SecureBootEnable`, `SecureBootCurrentBoot` and `SecureBootMode` but no certificate inventory, at any firmware level including v3.19. The System ROM version only shows what the *default* databases contain, never what is active in `db`. Certificate contents are visible only in the Embedded UEFI Shell, RBSU, or from inside the OS.
+- **No selective reset.** `SecureBoot.ResetKeys` accepts exactly `ResetAllKeysToDefault`, `DeleteAllKeys` and `DeletePK`. No iLO 5 Redfish resource, BIOS attribute or `ilorest` command resets a single database, exports keys, or enrols keys.
+- **The only remote reset wipes everything** (PK, KEK, db, dbx and all customer keys) and disables Secure Boot. It is HPE's documented method in the advisory, but it is not validated here and the scripts do not issue it against iLO 5.
+
+Everything selective happens in RBSU, reachable through the iLO remote console but interactive. The following is **field-tested, not HPE-documented**. HPE's advisory prescribes only the all-keys reset and says nothing about resetting `db` alone. On the tested servers, only the `db` variable needed resetting to load the new certificates from the updated System ROM; some firmware could not be installed until that was done.
+
+1. Update the System ROM to the baseline in the [advisory](https://support.hpe.com/hpesc/public/docDisplay?docId=a00156355en_us&docLocale=en_US).
+2. RBSU → *Server Security → Secure Boot Settings → Advanced Secure Boot Options* → **Export all keys** to a USB or SD device in the server. Resetting `db` removes custom entries.
+3. In the same menu, open **DB** → **Reset to platform defaults**.
+4. Re-enrol any custom entries from the exported media.
+5. Verify in the Embedded UEFI Shell or from inside the OS that the 2023 certificates are present, and that Secure Boot is still enabled.
+
+HPE does not document whether a `db`-only reset keeps Secure Boot enabled or leaves PK, KEK and dbx untouched — record the before and after state on the first server of each model. Apply the same BitLocker and TPM precautions as for the all-keys reset.
 
 ### Gen12
 
@@ -177,7 +189,7 @@ No firmware path exists. The last DL380 Gen9 System ROM (P89 v3.30, 2023-09-21) 
 ### Known traps
 
 - **HPE's own option ROM signing certificate lives in the default `db`.** Hand-curating the database instead of resetting to defaults, and dropping the HPE entry, means Smart Array and NIC option ROMs will not load and the server will not boot with Secure Boot enabled.
-- **HPE prunes expired vendor certificates from defaults.** DL380 Gen10 ROM 3.50 (2025-04): *"Removed Expired SUSE and Vmware Certificates."* If you depend on them, a reset removes them.
+- **HPE prunes expired vendor certificates from defaults.** Older ROMs, e.g. 3.50 (2025-04): *"Removed Expired SUSE and Vmware Certificates."* If you depend on them, a reset removes them.
 - **iLO 6 1.61 ↔ 1.62 requires a server reboot** in either direction, or the BIOS and iLO Secure Boot databases desynchronise.
 - **iLO 6 1.62 added `DELETE` on certificates in the read-only Default databases.** Deleting entries from `dbDefault` or `KEKDefault` silently degrades the very defaults remediation depends on.
 - **Option ROM failures are OS-independent and look like missing hardware.** A card with a 2023-signed option ROM in a system without `Option ROM UEFI CA 2023` will not initialise and **disappears from RBSU** — it presents as a missing PCIe device, not a boot error.

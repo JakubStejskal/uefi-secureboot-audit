@@ -1,7 +1,5 @@
 ILOHost,Note
 ilo-esx01.example.local,DL380 Gen11 - vSphere cluster A
 ilo-esx02.example.local,DL380 Gen11 - vSphere cluster A
-10.0.10.51,DL380 Gen10 - legacy, iLO 5 (no cert read-out)
-10.0.10.52,DL360 Gen10 Plus - legacy
 ilo-db01.example.local,DL385 Gen11 AMD
 ilo-new01.example.local,DL380 Gen12 - verify only

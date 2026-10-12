@@ -13,11 +13,9 @@ a00156355en_us rev. 5 (2026-07-02) and Broadcom's revised VM guidance.
 
 | Claim in legacy docs | Correction |
 |---|---|
-| Gen10 min. ROM `3.40_01-16-2025` | **3.62** (Intel) / **3.70** (AMD); DL20, ML30, m750 need **3.72** |
-| Gen10 Plus min. ROM `2.30` | Correct for Intel; AMD needs **3.50** |
 | Gen11 min. ROM `2.42` | Correct for Intel; AMD needs **2.30** |
 | Gen12 | Not covered at all — 2023 certificates are active from the factory, key reset **must not** be performed |
-| iLO 5 `SecureBootDatabases`: *"only with a sufficiently new ROM"* | **Incorrect.** iLO 5 never exposes `SecureBootDatabases`, at any firmware level including v3.19. Introduced in iLO 6 v1.10 |
+| iLO 5 `SecureBootDatabases`: *"only with a sufficiently new ROM"* | **Incorrect.** iLO 5 never exposes `SecureBootDatabases`; introduced in iLO 6 v1.10. `list-ilo5-uefi-certs.py` was removed for this reason |
 | Detects `KEK_2023` and `DB_2023` | Four certificates must be checked. `Microsoft Option ROM UEFI CA 2023` is separate from `Microsoft UEFI CA 2023` and is the one most often missing |
 | VM guidance | Predates `VMW.NULLPK`, SilentPK, and ESXi 8.0 U3j (build 25429389) |
 
