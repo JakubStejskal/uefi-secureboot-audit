@@ -2,32 +2,21 @@
 <#
 .SYNOPSIS
     Audits UEFI Secure Boot certificate readiness (Microsoft 2011 -> 2023 CA transition)
-    across HPE ProLiant / Synergy Gen10, Gen10 Plus, Gen11 and Gen12 via iLO Redfish.
+    across HPE ProLiant / Synergy Gen11 and Gen12 via iLO Redfish.
 
 .DESCRIPTION
     READ-ONLY. This script never writes to NVRAM, never changes firmware, and never
     reboots anything.
 
-    It operates in one of two modes, selected automatically from the detected iLO
-    generation:
+    iLO 6 (Gen11) and iLO 7 (Gen12) expose the full inventory of PK / KEK / db / dbx
+    including ValidNotAfter through SecureBootDatabases.
 
-      iLO 5 (Gen10 / Gen10 Plus)
-          /redfish/v1/Systems/1/SecureBoot        EXISTS
-          /redfish/v1/Systems/1/SecureBoot/SecureBootDatabases   DOES NOT EXIST
-          Certificates cannot be enumerated out-of-band at all. The verdict is
-          therefore derived indirectly from the System ROM version, compared against
-          HPE Customer Advisory a00156355en_us.
+    iLO 5 servers are out of scope: the iLO 5 Redfish API has no certificate
+    inventory, so no meaningful remote audit is possible (see docs/runbook.md). If one
+    is passed in, it is reported as OUT_OF_SCOPE and nothing else is evaluated.
 
-      iLO 6 (Gen11) / iLO 7 (Gen12)
-          Full inventory of PK / KEK / db / dbx including ValidNotAfter.
-
-    The iLO 5 limitation is a property of iLO 5, not a bug in this script and not a
-    firmware-version problem. It is absent from the iLO 5 Redfish resource map for
-    every firmware release including the most recent (v3.19). SecureBootDatabases was
-    introduced in iLO 6 v1.10.
-
-    Where the certificate inventory is unavailable, the script reports
-    ROM_OK_CERTS_UNKNOWN rather than claiming compliance it cannot prove.
+    Where the certificate inventory is unavailable on an in-scope server, the script
+    reports ROM_OK_CERTS_UNKNOWN rather than claiming compliance it cannot prove.
 
 .PARAMETER ILOHost
     One or more iLO hostnames / IP addresses.
@@ -62,7 +51,8 @@
         COMPLIANT             all four 2023 certificates present (or Gen12)
         NEEDS_KEY_RESET       ROM meets baseline, live databases still lack 2023 certs
         NEEDS_ROM_AND_RESET   System ROM below advisory baseline
-        ROM_OK_CERTS_UNKNOWN  iLO 5: ROM is fine, certificate state unverifiable here
+        ROM_OK_CERTS_UNKNOWN  ROM is fine, but iLO did not report a certificate inventory
+        OUT_OF_SCOPE          iLO 5 server - no remote audit possible, see docs/runbook.md
         NOT_SUPPORTED         Gen9 - no firmware path exists
         ERROR                 unreachable / auth failure / unexpected response
 
@@ -131,10 +121,6 @@ $script:Required2023 = @(
 # These are the versions in which the LAST of the four certificates (Option ROM UEFI
 # CA 2023) landed. Earlier ROMs may already carry the other three.
 $script:RomBaseline = @{
-    'Gen10|Intel'      = '3.62'
-    'Gen10|AMD'        = '3.70'
-    'Gen10 Plus|Intel' = '2.30'
-    'Gen10 Plus|AMD'   = '3.50'
     'Gen11|Intel'      = '2.42'
     'Gen11|AMD'        = '2.30'
 }
@@ -333,11 +319,7 @@ function Get-RequiredRomVersion {
 
     if ($Generation -eq 'Gen12') { return $null }           # 2023 certs active from factory
     if ($Generation -in 'Gen9', 'Unknown') { return $null }  # no firmware path / unknown
-
-    # Advisory exception: DL20 Gen10, ML30 Gen10 and m750 baseline at 3.72, not 3.62.
-    if ($Generation -eq 'Gen10' -and $Arch -eq 'Intel' -and $Model -match 'DL20|ML30|m750') {
-        return [version]'3.72'
-    }
+    if ($Generation -in 'Gen10', 'Gen10 Plus') { return $null }  # out of scope (iLO 5)
 
     $key = "$Generation|$Arch"
     if ($script:RomBaseline.ContainsKey($key)) { return [version]$script:RomBaseline[$key] }
@@ -347,7 +329,7 @@ function Get-RequiredRomVersion {
 function Get-SecureBootCertificateInventory {
     <#
       Returns an array of Database/CommonName/NotAfter/Serial objects, or $null when
-      SecureBootDatabases is absent (iLO 5). $null is an expected state, not a fault.
+      SecureBootDatabases is absent. $null is an expected state, not a fault.
 
       Only live databases are read. The read-only *Default collections hold the OEM
       defaults that a key reset would apply, not what the platform is using now.
@@ -480,6 +462,7 @@ function Get-HPESecureBootStatus {
             }
             elseif ($row.Generation -eq 'Gen12') { $row.RomStatus = 'NA_FactoryDefault' }
             elseif ($row.Generation -eq 'Gen9')  { $row.RomStatus = 'NO_FIRMWARE_PATH' }
+            elseif ($row.Generation -in 'Gen10', 'Gen10 Plus') { $row.RomStatus = 'OUT_OF_SCOPE' }
             else { $row.RomStatus = 'Unknown' }
         }
 
@@ -545,11 +528,14 @@ function Get-Verdict {
     if ($Row.Generation -eq 'Gen9') {
         return @('NOT_SUPPORTED', 'Gen9 will not receive a System ROM containing the 2023 certificates. Options: manual enrolment in RBSU, run without Secure Boot, or hardware refresh.')
     }
+    if ($Row.Generation -in 'Gen10', 'Gen10 Plus') {
+        return @('OUT_OF_SCOPE', 'iLO 5 server: the iLO 5 API cannot report Secure Boot certificates, so a remote audit is not possible. See docs/runbook.md.')
+    }
     if ($Row.Generation -eq 'Gen12') {
         return @('COMPLIANT', 'Gen12 ships with the 2023 certificates included AND enabled. A key reset is NOT required - verify only.')
     }
 
-    # Gen11 / Gen12 with a readable inventory: hard evidence.
+    # Readable inventory: hard evidence.
     if ($Row.CertInventory -eq 'OK') {
         $missing = @()
         if (-not $Row.Has_KEK2023)             { $missing += 'KEK 2K CA 2023' }
@@ -565,15 +551,15 @@ function Get-Verdict {
         return @('NEEDS_ROM_AND_RESET', "Missing: $($missing -join ', '). Update System ROM to >= $($Row.RomRequired) first, then reset keys.")
     }
 
-    # Gen10 / Gen10 Plus: certificates unreadable, ROM version is the only signal.
-    # Note it is a necessary but NOT sufficient condition - a compliant ROM whose keys
-    # were never reset still runs on 2011-only certificates.
+    # Inventory not reported: ROM version is the only signal. It is a necessary but NOT
+    # sufficient condition - a compliant ROM whose keys were never reset still runs on
+    # 2011-only certificates.
     switch ($Row.RomStatus) {
         'UPDATE_REQUIRED' {
             return @('NEEDS_ROM_AND_RESET', "System ROM $($Row.RomVersion) is below the required $($Row.RomRequired). Flash the ROM, then reset keys.")
         }
         'OK' {
-            return @('ROM_OK_CERTS_UNKNOWN', "System ROM meets the baseline, but iLO 5 cannot enumerate Secure Boot certificates. Verify via Embedded UEFI Shell 'secboot -l KEK' / 'secboot -l db', RBSU, or from inside the OS. If the key reset was never performed, the 2023 certificates are NOT active.")
+            return @('ROM_OK_CERTS_UNKNOWN', "System ROM meets the baseline, but iLO did not report a certificate inventory. Verify via the Embedded UEFI Shell, RBSU, or from inside the OS. If the key reset was never performed, the 2023 certificates are NOT active.")
         }
         default {
             return @('UNKNOWN', 'Could not determine System ROM version or server generation - verify manually.')

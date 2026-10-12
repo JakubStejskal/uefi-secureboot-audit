@@ -1,8 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-    Staged remediation of UEFI Secure Boot keys on HPE ProLiant Gen10 / Gen10 Plus /
-    Gen11 via iLO Redfish - activating the Microsoft 2023 certificates after a
+    Staged remediation of UEFI Secure Boot keys on HPE ProLiant Gen11 via iLO Redfish - activating the Microsoft 2023 certificates after a
     System ROM update.
 
 .DESCRIPTION
@@ -118,8 +117,6 @@ $ErrorActionPreference = 'Stop'
 
 # Minimum System ROM per HPE advisory a00156355en_us rev. 5 (2026-07-02).
 $script:RomBaseline = @{
-    'Gen10|Intel' = '3.62'; 'Gen10|AMD' = '3.70'
-    'Gen10 Plus|Intel' = '2.30'; 'Gen10 Plus|AMD' = '3.50'
     'Gen11|Intel' = '2.42'; 'Gen11|AMD' = '2.30'
 }
 $script:Required2023 = @(
@@ -237,8 +234,7 @@ function Get-Context {
     if ($bios -match 'v(\d+\.\d+(\.\d+)?)') { $romVer = [version]$Matches[1] }
 
     $req = $null
-    if ($gen -eq 'Gen10' -and $arch -eq 'Intel' -and $model -match 'DL20|ML30|m750') { $req = [version]'3.72' }
-    elseif ($script:RomBaseline.ContainsKey("$gen|$arch")) { $req = [version]$script:RomBaseline["$gen|$arch"] }
+    if ($script:RomBaseline.ContainsKey("$gen|$arch")) { $req = [version]$script:RomBaseline["$gen|$arch"] }
 
     $sb = Invoke-Redfish -Uri "$sysUri/SecureBoot" -Headers $Conn.Headers -AllowNotFound
 
@@ -287,12 +283,12 @@ function Save-KeyBackup {
     if (-not $Certs -or $Certs.Count -eq 0) {
         Write-Warning @'
 No key backup could be taken - this iLO does not expose the certificate inventory.
-On Gen10 / Gen10 Plus (iLO 5) export manually before proceeding:
-  RBSU -> Server Security -> Secure Boot Settings -> Advanced Secure Boot Options -> Export all keys
+Export the keys manually before proceeding (RBSU -> Server Security -> Secure Boot Settings -> Advanced Secure Boot Options -> Export all keys).
 '@
         return $null
     }
-    $dir = Join-Path $BackupPath ('{0}_{1}' -f $HostName, (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    $safeHost = $HostName -replace '[^\w\.\-]', '_'   # ':' (port, IPv6) is not a valid path character on Windows
+    $dir = Join-Path $BackupPath ('{0}_{1}' -f $safeHost, (Get-Date -Format 'yyyyMMdd-HHmmss'))
     $null = New-Item -ItemType Directory -Path $dir -Force
     $Certs | ConvertTo-Json -Depth 6 | Set-Content -Path (Join-Path $dir 'certificates.json') -Encoding UTF8
     $i = 0
@@ -335,6 +331,10 @@ try {
     Initialize-TlsBypass
     $conn = Connect-ILO -HostName $ILOHost
     $ctx  = Get-Context -Conn $conn
+    if ($ctx.Generation -in 'Gen10', 'Gen10 Plus') {
+        # Not overridable with -Force: iLO 5 offers only an all-keys reset, which is not validated here.
+        throw 'iLO 5 servers are out of scope for this script. See docs/runbook.md for the manual procedure.'
+    }
 
     Write-Host ''
     Write-Host "Host        : $ILOHost"
@@ -357,7 +357,7 @@ try {
 
         'Verify' {
             if ($null -eq $certs) {
-                Write-Warning "iLO $($ctx.ILOGeneration) does not expose the Secure Boot database inventory (iLO 5 = Gen10 / Gen10 Plus). Verify in the Embedded UEFI Shell:  secboot -l KEK   and   secboot -l db"
+                Write-Warning "iLO $($ctx.ILOGeneration) does not expose the Secure Boot database inventory. Verify in the Embedded UEFI Shell or from inside the OS."
                 $romVerdict = if ($ctx.RomVersion -and $ctx.RomRequired -and $ctx.RomVersion -ge $ctx.RomRequired) { 'ROM OK' } else { 'ROM BELOW BASELINE' }
                 Write-Host "Indirect signal only: System ROM $($ctx.BiosVersion) vs baseline $($ctx.RomRequired) -> $romVerdict"
                 break

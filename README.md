@@ -1,6 +1,6 @@
 # UEFI Secure Boot Audit — Microsoft CA 2011 → 2023
 
-Audit and remediation tooling for the Microsoft Secure Boot certificate expiration, covering **HPE ProLiant Gen10 / Gen10 Plus / Gen11 / Gen12**, **VMware ESXi hosts**, and **virtual machines running on ESXi**.
+Audit and remediation tooling for the Microsoft Secure Boot certificate expiration, covering **HPE ProLiant Gen11 / Gen12**, **VMware ESXi hosts**, and **virtual machines running on ESXi**.
 
 > **Status as of 2026-08-04:** two of the three 2011 CAs have already expired. Nothing broke, and nothing was supposed to. The last live deadline is **19 October 2026**.
 
@@ -33,34 +33,27 @@ The documented at-scale outage so far is **Citrix MCS** ([CTX696696](https://sup
 
 ## HPE generation matrix
 
-HPE delivers the 2023 certificates **only through System ROM**. There is no separate certificate utility, and iLO firmware is not the delivery vehicle — advisory revision 2 removed iLO 5 from the affected-products list for exactly this reason.
+HPE delivers the 2023 certificates **only through System ROM**. There is no separate certificate utility, and iLO firmware is not the delivery vehicle.
 
 | Generation | Min. System ROM | Key reset | iLO certificate read-out |
 |---|---|---|---|
-| **Gen10** (iLO 5) | Intel **3.62** · AMD **3.70**<br>*DL20 / ML30 / m750: 3.72* | Required | ❌ **Not possible** |
-| **Gen10 Plus** (iLO 5) | Intel **2.30** · AMD **3.50** | Required | ❌ **Not possible** |
-| **Gen11** (iLO 6 ≥ 1.10) | Intel **2.42** · AMD **2.30** | Required | ✅ Full inventory |
+| **Gen11** (iLO 6 ≥ 1.10) | Intel **2.42** · AMD **2.30** | Required per advisory | ✅ Full inventory |
 | **Gen12** (iLO 7 ≥ 1.11) | — (factory) | **Not required** | ✅ Full inventory |
 | Gen9 (iLO 4) | *none exists* | — | ❌ No API |
 
-Source: [HPE Customer Advisory a00156355en_us](https://support.hpe.com/hpesc/public/docDisplay?docId=a00156355en_us&docLocale=en_US), rev. 5 (2026-07-02). In practice **any 2026 SPP** satisfies the Gen10 / Gen10 Plus / Gen11 baselines.
+Source: [HPE Customer Advisory a00156355en_us](https://support.hpe.com/hpesc/public/docDisplay?docId=a00156355en_us&docLocale=en_US), rev. 5 (2026-07-02). In practice **any 2026 SPP** satisfies the Gen11 baseline.
 
-### The iLO 5 limitation is real and permanent
+> Gen11 is listed as "required" because that is what the advisory states. Some Gen11 hosts were observed to need no manual step; confirm by reading the live `db` before skipping the reset.
 
-On Gen10 and Gen10 Plus you **cannot enumerate Secure Boot certificates out-of-band at all**. This is a property of iLO 5, not a firmware-version problem and not a configuration issue:
+### Servers with iLO 5 (Gen10 / Gen10 Plus) are out of scope
 
-- The iLO 5 Redfish resource map exposes exactly one Secure Boot URI — `/redfish/v1/Systems/1/SecureBoot` — for **every** firmware release including the latest (v3.19).
-- `SecureBootDatabases` does not appear anywhere in the iLO 5 changelog or API reference. It was introduced in **iLO 6 v1.10**.
+The tooling here does not audit or remediate iLO 5 servers, because **in practice it cannot be done remotely**:
 
-What you get on iLO 5 is `SecureBootEnable`, `SecureBootCurrentBoot`, `SecureBootMode`, and the `ResetKeys` action. Certificate state must be inferred from the System ROM version, or verified out of band:
+- iLO 5 has no certificate inventory (`SecureBootDatabases` does not exist at any firmware level), so a fleet audit is not possible.
+- The only remote reset iLO 5 offers wipes **all** keys and disables Secure Boot.
+- Resetting a single database, exporting keys and enrolling keys are available only locally in RBSU (reachable through the iLO remote console, but not scriptable).
 
-```
-# Embedded UEFI Shell
-secboot -l KEK
-secboot -l db
-```
-
-`HPE-SecureBootAudit.ps1` handles this by reporting `ROM_OK_CERTS_UNKNOWN` rather than claiming a compliance it cannot prove.
+A manual, field-tested procedure and its caveats are in the [runbook](docs/runbook.md#servers-with-ilo-5-gen10--gen10-plus--manual-procedure).
 
 ### A ROM update alone does nothing
 
@@ -127,7 +120,7 @@ All scripts run on Windows PowerShell 5.1 and PowerShell 7+.
 
 | Script | Mode | Purpose |
 |---|---|---|
-| [`scripts/HPE-SecureBootAudit.ps1`](scripts/HPE-SecureBootAudit.ps1) | read-only | Fleet audit via iLO Redfish, Gen10 → Gen12, with graceful degradation on iLO 5 |
+| [`scripts/HPE-SecureBootAudit.ps1`](scripts/HPE-SecureBootAudit.ps1) | read-only | Fleet audit via iLO Redfish, Gen11 / Gen12 |
 | [`scripts/HPE-SecureBootRemediate.ps1`](scripts/HPE-SecureBootRemediate.ps1) | **destructive** | Staged key reset with preflight guards and pre-change key export |
 | [`scripts/VMware-SecureBootAudit.ps1`](scripts/VMware-SecureBootAudit.ps1) | read-only | ESXi host and VM risk classification, optional in-guest verification |
 
@@ -152,7 +145,8 @@ $cred = Get-Credential
 | `COMPLIANT` | All four 2023 certificates present, or Gen12 |
 | `NEEDS_KEY_RESET` | ROM meets baseline, live databases still lack 2023 certs |
 | `NEEDS_ROM_AND_RESET` | System ROM below the advisory baseline |
-| `ROM_OK_CERTS_UNKNOWN` | iLO 5 — ROM is fine, certificate state unverifiable out-of-band |
+| `ROM_OK_CERTS_UNKNOWN` | ROM is fine, but iLO did not report a certificate inventory |
+| `OUT_OF_SCOPE` | iLO 5 server — no remote audit possible, see [runbook](docs/runbook.md) |
 | `NOT_SUPPORTED` | Gen9 — no firmware path exists |
 | `ERROR` | Unreachable, auth failure, or unexpected response |
 
@@ -176,7 +170,7 @@ Three stages, each requiring a reboot in between.
 
 Preflight **blocks** the reset when the System ROM is below baseline (a reset would restore 2011-only defaults — a silent regression), and on Gen12 and Gen9 where it is pointless or harmful. `-Force` overrides; the block exists for a reason.
 
-Before the reset, all readable certificates are exported to `.\secureboot-backup\<host>_<timestamp>\` as PEM plus a JSON manifest. On iLO 5, where no read-out is possible, the script warns you to export manually from RBSU.
+Before the reset, all readable certificates are exported to `.\secureboot-backup\<host>_<timestamp>\` as PEM plus a JSON manifest. The script refuses iLO 5 servers outright (not overridable with `-Force`).
 
 ### Audit VMware
 
@@ -198,7 +192,7 @@ Connect-VIServer vcsa01
 1. **Audit both sides.** Classify by verdict and risk before changing anything.
 2. **Escrow the recovery material.** ESXi TPM recovery keys off-host; BitLocker recovery passwords out of the VMs.
 3. **vCenter → ESXi hosts** to 8.0 U3j (`25429389`) or ESX 9.1 (`25370933`).
-4. **HPE System ROM** (any 2026 SPP) in batches.
+4. **HPE System ROM** (any 2026 SPP) in batches. iLO 5 servers follow the manual procedure in the runbook.
 5. **Key reset + re-enable Secure Boot** in a maintenance window, three reboots per server.
 6. **Power-cycle VMs** so SilentPK applies the PK.
 7. **Windows in-guest servicing** — set `AvailableUpdates` to `0x5944`, run the scheduled task, confirm Event **1808**.
@@ -226,7 +220,7 @@ Windows in-guest details, event IDs and Linux guidance are in the [runbook](docs
 
 The previous OneView-based tooling is preserved under [`legacy/`](legacy/), including `hpe-secureboot-audit-v2.sh` with OneView SSO discovery — a capability the v2 scripts do not yet have. The original Czech README is at [`legacy/README.cs.md`](legacy/README.cs.md).
 
-⚠️ The legacy scripts carry **outdated ROM baselines** (Gen10 listed as 3.40 rather than 3.62) and state that iLO 5 exposes `SecureBootDatabases` "with a sufficiently new ROM", which is not correct. Use them for OneView discovery only; take the certificate facts from this README.
+⚠️ The legacy scripts carry **outdated ROM baselines** and assumptions that no longer hold. Use them for OneView discovery only; take the certificate facts from this README.
 
 ---
 

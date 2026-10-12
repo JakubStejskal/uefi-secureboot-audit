@@ -1,5 +1,30 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- **Servers with iLO 5 (Gen10 / Gen10 Plus) are out of scope.** In practice they cannot be
+  audited or remediated remotely: iLO 5 has no certificate inventory, and its only remote
+  reset (`ResetAllKeysToDefault`) wipes every key and disables Secure Boot. The audit script
+  reports them as `OUT_OF_SCOPE`; the remediation script refuses them (not overridable with
+  `-Force`). ROM baselines for these generations were removed from both scripts.
+- Removed iLO 5 rows from `examples/fleet.csv` and the legacy `list-ilo5-uefi-certs.py`
+  (its premise, `SecureBootDatabases` on iLO 5, does not hold).
+
+### Fixed
+
+- `HPE-SecureBootRemediate.ps1`: the key-backup folder name is now sanitised, so an iLO
+  address containing `:` (port or IPv6) no longer breaks the backup on Windows.
+
+### Added
+
+- Runbook section with a manual, field-tested RBSU procedure for iLO 5 servers: export keys
+  to USB/SD, reset **only `db`** to platform defaults, re-enrol custom entries. Marked as
+  not HPE-documented; the advisory prescribes only the all-keys reset.
+- Note that Gen11 is listed as "reset required" per the advisory, while some hosts were
+  observed to need no manual step; verify by reading the live `db`.
+
 ## [2.0.0] — 2026-08-04
 
 Rewrite around HPE Customer Advisory a00156355en_us rev. 5 (2026-07-02) and Broadcom's

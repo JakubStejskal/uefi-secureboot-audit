@@ -77,7 +77,7 @@ mokutil --kek | grep -i 'KEK 2K CA 2023'
 tail -c +5 /sys/firmware/efi/efivars/db-d719b2cb-3d3a-4596-a3bc-dad00e67656f > db.esl
 ```
 
-**HPE Embedded UEFI Shell** — the only out-of-band option on Gen10 / Gen10 Plus:
+**HPE Embedded UEFI Shell** — the only out-of-band option on servers with iLO 5:
 
 ```
 secboot -l KEK
