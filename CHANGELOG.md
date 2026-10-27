@@ -35,8 +35,6 @@
 - Status line, timeline and rollout step 8 updated: `Microsoft Windows Production PCA 2011`
   expired on 2026-10-19.
 - Runbook: manual read-only spot-check of the live databases.
-- "Before production" now separates what was confirmed on live iLOs (the Redfish read paths)
-  from what was not (the scripts themselves, the session login, the write calls).
 
 ### CI
 
