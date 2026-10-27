@@ -19,6 +19,13 @@
   counted as present. KEK 2023 is now required in `KEK` and the three CAs in `db`.
 - **`-ILOHost https://10.0.0.5/` failed with `ERROR`.** Scheme, path and trailing slash are
   stripped; duplicates are removed.
+- **Windows PowerShell 5.1: every request failed with "The underlying connection was closed:
+  An unexpected error occurred on a send"** when `-SkipCertificateCheck` was used. The TLS
+  bypass was a scriptblock (`{ $true }`), which cannot run on a handshake thread without a
+  PowerShell runspace ("There is no Runspace available to run scripts in this thread"). Both
+  HPE scripts now install a compiled `RemoteCertificateValidationCallback`. Reproduced on
+  5.1.26100 against the mock iLO; PowerShell 7 was never affected (per-call
+  `-SkipCertificateCheck`).
 
 ### Added
 

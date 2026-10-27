@@ -155,8 +155,21 @@ function Initialize-TlsBypass {
     if (-not $SkipCertificateCheck) { return }
     if ($PSVersionTable.PSVersion.Major -ge 6) { return }   # PS7 uses per-call -SkipCertificateCheck
 
+    # A compiled delegate, not a scriptblock: the TLS handshake can run on a thread without a
+    # PowerShell runspace, where '{ $true }' fails with "There is no Runspace available to run
+    # scripts in this thread" and every request dies as "underlying connection was closed".
+    if (-not ('TrustAllCertsCallback' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class TrustAllCertsCallback {
+    public static bool Accept(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; }
+    public static RemoteCertificateValidationCallback Callback { get { return new RemoteCertificateValidationCallback(Accept); } }
+}
+'@
+    }
     $script:OriginalCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [TrustAllCertsCallback]::Callback
     $script:CallbackModified = $true
     [System.Net.ServicePointManager]::SecurityProtocol =
         [System.Net.SecurityProtocolType]::Tls12 -bor [System.Net.SecurityProtocolType]::Tls11

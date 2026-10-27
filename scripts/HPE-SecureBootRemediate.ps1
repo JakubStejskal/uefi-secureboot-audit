@@ -130,8 +130,19 @@ $script:OriginalCallback = $null; $script:CallbackModified = $false
 
 function Initialize-TlsBypass {
     if (-not $SkipCertificateCheck -or $PSVersionTable.PSVersion.Major -ge 6) { return }
+    # Compiled delegate, not '{ $true }' (see the audit script: no runspace on the handshake thread).
+    if (-not ('TrustAllCertsCallback' -as [type])) {
+        Add-Type -TypeDefinition @'
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class TrustAllCertsCallback {
+    public static bool Accept(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; }
+    public static RemoteCertificateValidationCallback Callback { get { return new RemoteCertificateValidationCallback(Accept); } }
+}
+'@
+    }
     $script:OriginalCallback = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [TrustAllCertsCallback]::Callback
     $script:CallbackModified = $true
     [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
 }
