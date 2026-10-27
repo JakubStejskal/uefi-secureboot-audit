@@ -2,9 +2,9 @@
 
 Audit and remediation tooling for the Microsoft Secure Boot certificate expiration, covering **HPE ProLiant Gen11 / Gen12**, **VMware ESXi hosts**, and **virtual machines running on ESXi**.
 
-> **Status as of 2026-08-04:** two of the three 2011 CAs have already expired. Nothing broke, and nothing was supposed to. The last live deadline is **19 October 2026**.
+> **Status as of 2026-10-27:** all three 2011 CAs are past their expiry date; the last one, `Microsoft Windows Production PCA 2011`, expired on **2026-10-19**. Expiry alone is not revocation (see below). The sourced findings in this README date from 2026-08-04 and were not re-researched after that last expiry.
 
-📘 **[Full runbook →](docs/runbook.md)** · 📋 **[Certificate reference →](docs/certificate-reference.md)**
+📘 **[Full runbook →](docs/runbook.md)** · 📋 **[Certificate reference →](docs/certificate-reference.md)** · 🚀 **[Quick start →](#quick-start)**
 
 ---
 
@@ -27,7 +27,7 @@ The documented at-scale outage so far is **Citrix MCS** ([CTX696696](https://sup
 |---|---|---|
 | 2026-06-24 | Microsoft Corporation KEK CA 2011 | **Expired** |
 | 2026-06-27 | Microsoft Corporation UEFI CA 2011 | **Expired** |
-| **2026-10-19** | **Microsoft Windows Production PCA 2011** | **Upcoming** |
+| 2026-10-19 | Microsoft Windows Production PCA 2011 | **Expired** |
 
 ---
 
@@ -114,6 +114,28 @@ Hardware version thresholds: **14+** is a hard requirement for any PK update; **
 
 ---
 
+## Quick start
+
+**Requirements**
+
+- Windows PowerShell 5.1 or PowerShell 7+. The two HPE scripts need no modules. `VMware-SecureBootAudit.ps1` needs **VMware.PowerCLI** and a vCenter (or ESXi) connection.
+- HTTPS (443) from the machine you run it on to every iLO. iLO certificates are usually self-signed, so pass `-SkipCertificateCheck`.
+- Downloaded as a zip on Windows? Run `Get-ChildItem .\scripts | Unblock-File` first, otherwise PowerShell may refuse to run the scripts.
+- An iLO account that can read the system. Remediation needs one that may change BIOS / Secure Boot settings. The minimum iLO privileges have not been verified, so use an administrator account in a lab until you have.
+- Each script has built-in help: `Get-Help .\scripts\HPE-SecureBootAudit.ps1 -Full`.
+- The HPE scripts log in with a Redfish session (not Basic auth) and log out when done, because iLO has a low simultaneous-session limit.
+
+**The path through the tooling**
+
+1. **Audit** (read-only, changes nothing): [Audit an HPE fleet](#audit-an-hpe-fleet) and [Audit VMware](#audit-vmware).
+2. **Read the `Verdict`** against [the next-step table](#verdicts-and-next-steps). `COMPLIANT` means you are done with that host; do not run the remediation script on it.
+3. **Remediate only `NEEDS_KEY_RESET` / `NEEDS_ROM_AND_RESET` / `CERTS_OK_SECUREBOOT_OFF`** hosts, following the [checklist](#remediate).
+4. **Audit again** and confirm every host reports `COMPLIANT`.
+
+Nothing in this repository reboots a server, puts a host into maintenance mode or touches a VM's NVRAM.
+
+---
+
 ## Scripts
 
 All scripts run on Windows PowerShell 5.1 and PowerShell 7+.
@@ -141,42 +163,86 @@ $r | Where-Object Verdict -ne 'COMPLIANT' | Format-List ILOHost,Verdict,Missing2
     -SkipCertificateCheck -OutputCsv .\hpe-audit.csv -OutputJson .\hpe-audit.json
 ```
 
-**Verdicts:**
+### Verdicts and next steps
 
-| Verdict | Meaning |
-|---|---|
-| `COMPLIANT` | Read from the live databases: KEK 2023 in `KEK`, the three 2023 CAs in `db`, Secure Boot enforcing (PK present, UserMode) |
-| `CERTS_OK_SECUREBOOT_OFF` | Certificates complete, but Secure Boot is disabled or the platform is in SetupMode (no PK) |
-| `NEEDS_KEY_RESET` | Live databases lack 2023 certs; ROM meets baseline (Gen11) or is factory-capable (Gen12) |
-| `NEEDS_ROM_AND_RESET` | Live databases lack 2023 certs and System ROM is below the advisory baseline |
-| `ROM_OK_CERTS_UNKNOWN` | Gen11: ROM meets baseline, live databases could not be read (see `CertInventoryNote`) |
-| `UNVERIFIED` | Gen12: live databases could not be read (see `CertInventoryNote`) |
-| `UNKNOWN` | Generation or System ROM version could not be determined |
-| `OUT_OF_SCOPE` | iLO 5 server — no remote audit possible, see [runbook](docs/runbook.md) |
-| `NOT_SUPPORTED` | Gen9 — no firmware path exists |
-| `ERROR` | Unreachable, auth failure, or unexpected response |
+| Verdict | Meaning | Next step |
+|---|---|---|
+| `COMPLIANT` | Read from the live databases: KEK 2023 in `KEK`, the three 2023 CAs in `db`, Secure Boot enforcing (PK present, UserMode) | **Nothing.** Do not run the remediation script. |
+| `CERTS_OK_SECUREBOOT_OFF` | Certificates complete, but Secure Boot is disabled or the platform is in SetupMode (no PK) | `-Stage EnableSecureBoot`. If `Has_PK` is `False`, a key reset is needed to restore the PK; preflight will report that the certificates are already present, and that is the one case where `-Force` is appropriate |
+| `NEEDS_KEY_RESET` | Live databases lack 2023 certs; ROM meets baseline (Gen11) or is factory-capable (Gen12) | [Remediate](#remediate). Gen12: the keys were customised after factory state, so compare with `dbDefault` / `KEKDefault` first ([runbook](docs/runbook.md#gen12)); preflight refuses a Gen12 reset without `-Force` |
+| `NEEDS_ROM_AND_RESET` | Live databases lack 2023 certs and System ROM is below the advisory baseline | Flash System ROM first, re-audit, then [remediate](#remediate) |
+| `ROM_OK_CERTS_UNKNOWN` | Gen11: ROM meets baseline, live databases could not be read (see `CertInventoryNote`) | Read `CertInventoryNote`, then verify in RBSU (*Advanced Secure Boot Options → View entries*) or the Embedded UEFI Shell |
+| `UNVERIFIED` | Gen12: live databases could not be read (see `CertInventoryNote`) | Same as above |
+| `UNKNOWN` | Generation or System ROM version could not be determined | Check `Model` and `BiosVersion`; verify by hand |
+| `OUT_OF_SCOPE` | iLO 5 server — no remote audit possible | [Manual procedure](docs/runbook.md#servers-with-ilo-5-gen10--gen10-plus--manual-procedure) |
+| `NOT_SUPPORTED` | Gen9 — no firmware path exists | None available |
+| `ERROR` | Unreachable, auth failure, or unexpected response | Read the `Error` column (network, credentials, TLS) and re-run for that host |
+
+### Output columns
+
+The audit returns one object per host; `-OutputCsv` / `-OutputJson` write all of them. A healthy Gen11 / Gen12 host looks like this:
+
+| Column | Meaning | Healthy value |
+|---|---|---|
+| `Reachable` | iLO login succeeded | `True` |
+| `Model`, `SerialNumber`, `Generation`, `Arch`, `ILOModel`, `ILOFirmware` | Identity from Redfish | — |
+| `BiosVersion`, `RomVersion`, `RomRequired` | System ROM found vs. advisory baseline | version ≥ `RomRequired` (Gen12: no baseline) |
+| `RomStatus` | `OK`, `UPDATE_REQUIRED`, `NA_FactoryDefault` (Gen12), `NO_FIRMWARE_PATH` (Gen9), `OUT_OF_SCOPE` (iLO 5), `Unknown` | `OK` or `NA_FactoryDefault` |
+| `SecureBootEnable`, `SecureBootCurrentBoot`, `SecureBootMode` | Raw values from the `SecureBoot` resource | `True` / `Enabled` / `UserMode` |
+| `SecureBootActive` | Booted with Secure Boot **and** a PK enrolled | `True` |
+| `CertInventory` | `OK`, `PARTIAL`, `EMPTY`, `NOT_REPORTED`, `UNSUPPORTED_ILO5`, `NotAttempted` | `OK` |
+| `CertInventoryNote` | Why the inventory is not `OK` | empty |
+| `DbCounts` | Certificates read per live database | `PK=1 KEK=3 db=8 dbx=3` on the two reference platforms; other platforms differ |
+| `Has_PK` | A PK is enrolled | `True` |
+| `Has_KEK2023`, `Has_WindowsUEFICA2023`, `Has_MicrosoftUEFICA2023`, `Has_OptionRomCA2023` | Each 2023 certificate in **its own** live database | all `True` |
+| `Missing2023` | The 2023 certificates not found, as `db:CN; …` | empty |
+| `Legacy2011InDb`, `Legacy2011InKEK` | 2011 certificates still present | `True` (expected; keep them) |
+| `Revoked2011InDbx` | A 2011 CA sits in `dbx` | `False` (if `True`, hosts that boot through it may stop booting) |
+| `Has_VMwareDbCert` | A `db` entry whose CN contains "VMware" | informational |
+| `CertDetail` | Every certificate read, as `db:CN (exp yyyy-MM-dd)` | — |
+| `Verdict`, `Action`, `Error` | Result, recommended action, failure reason | — |
 
 ### Remediate
 
-Three stages, each requiring a reboot in between.
+`HPE-SecureBootRemediate.ps1` takes **one** iLO per call (`-ILOHost`), is meant for Gen11 (Gen12 and Gen9 are blocked, iLO 5 is refused) and **never reboots the server**: the BIOS applies each change at the next POST, and the reboots in between are yours.
+
+**Checklist before stage 1**
+
+1. The audit says `NEEDS_KEY_RESET` or `NEEDS_ROM_AND_RESET` (System ROM flashed first), or `CERTS_OK_SECUREBOOT_OFF` for stage 2 only.
+2. **ESXi with TPM:** the recovery key is saved **off-host** (`esxcli system settings encryption recovery list`). For many hosts at once, [`esxi-tpm-recovery-export`](https://github.com/JakubStejskal/esxi-tpm-recovery-export) collects them through vCenter and can be limited to chosen hosts with `-VMHost`. Without the key a PSOD after the reset is unrecoverable.
+3. **Windows / Linux on the host:** BitLocker suspended and recovery passwords escrowed; TPM-sealed LUKS re-seal planned (PCR 7 changes).
+4. The ESXi host is in maintenance mode (you do this; the script does not). HPE recommends running Secure Boot database operations with the server powered off.
+5. Dry-run with `-WhatIf` (below). It prints the preflight result and sends no reset; it writes no backup either.
 
 ```powershell
-# Always dry-run first
+$cred = Get-Credential
+
+# 0. Dry-run: preflight + what would be sent, nothing changed
 .\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage ResetKeys -SkipCertificateCheck -WhatIf
 
-# 1. Reset keys (deletes enrolled keys, disables Secure Boot) → reboot
+# 1. Reset keys (deletes enrolled keys, disables Secure Boot) → reboot yourself
 .\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage ResetKeys -SkipCertificateCheck
 
-# 2. Re-enable Secure Boot → reboot
+# 2. Re-enable Secure Boot → reboot yourself
 .\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage EnableSecureBoot -SkipCertificateCheck
 
-# 3. Verify
+# 3. Verify (read-only): all four 2023 certificates present and Secure Boot enforcing
 .\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage Verify -SkipCertificateCheck
 ```
 
-Preflight **blocks** the reset when the System ROM is below baseline (a reset would restore 2011-only defaults — a silent regression), when the live `KEK` and `db` already hold all four 2023 certificates (it would gain nothing, disable Secure Boot and discard custom keys), and on Gen12 and Gen9 where it is pointless or harmful. `-Force` overrides; the block exists for a reason. `EnableSecureBoot` warns when no PK is enrolled (SetupMode enforces nothing).
+On ESXi, run `/sbin/auto-backup.sh` once the host is up after stage 2, or the new state is not re-sealed.
 
-Before the reset, all readable certificates are exported to `.\secureboot-backup\<host>_<timestamp>\` as PEM plus a JSON manifest. The script refuses iLO 5 servers outright (not overridable with `-Force`).
+To dry-run several hosts: `'ilo-esx01','ilo-esx02' | ForEach-Object { .\scripts\HPE-SecureBootRemediate.ps1 -ILOHost $_ -Credential $cred -Stage ResetKeys -SkipCertificateCheck -WhatIf }`. Run the real stages host by host or in small batches.
+
+**`BLOCKED`** means preflight refused stage 1 and printed the reason in red. It blocks when:
+
+- the System ROM is below baseline (a reset would restore 2011-only defaults, a silent regression): flash the ROM, do not override;
+- the live `KEK` and `db` already hold all four 2023 certificates (a reset gains nothing, disables Secure Boot and discards custom keys): do not override unless you are restoring a missing PK, see [the verdict table](#verdicts-and-next-steps);
+- the server is Gen12 or Gen9 (pointless or harmful).
+
+`-Force` overrides these; the block exists for a reason. It does **not** override the refusal of iLO 5 servers. `EnableSecureBoot` warns when no PK is enrolled (SetupMode enforces nothing).
+
+**Backup.** Before the reset, the readable certificates are exported to `.\secureboot-backup\<host>_<yyyyMMdd-HHmmss>\` as `certificates.json` plus one PEM per certificate (`-BackupPath` changes the root folder). Only certificate entries are exported (no `dbx` hashes). The script has no restore function; re-enrolling a custom key is manual (RBSU or the UEFI Shell).
 
 ### Audit VMware
 
@@ -202,7 +268,7 @@ Connect-VIServer vcsa01
 5. **Key reset + re-enable Secure Boot** in a maintenance window, three reboots per server.
 6. **Power-cycle VMs** so SilentPK applies the PK.
 7. **Windows in-guest servicing** — set `AvailableUpdates` to `0x5944`, run the scheduled task, confirm Event **1808**.
-8. **Re-audit** and close out before **2026-10-19**.
+8. **Re-audit** and confirm every host reports `COMPLIANT`. The last 2011 CA expired on 2026-10-19, so any host that does not is an open item.
 
 Windows in-guest details, event IDs and Linux guidance are in the [runbook](docs/runbook.md).
 
@@ -211,8 +277,8 @@ Windows in-guest details, event IDs and Linux guidance are in the [runbook](docs
 ## Before production
 
 - **Verify the ROM baselines against the current advisory revision.** HPE revised a00156355en_us five times between January and July 2026. The values here are from rev. 5.
-- **Test the remediation script on a lab server first.** The v2.1 scripts have been exercised against the mock iLO in [`tests/mock-ilo`](tests/mock-ilo/README.md) on PowerShell 7 and Windows PowerShell 5.1 (remediation: `Verify`, preflight blocks and `-WhatIf` only), not yet against live hardware. The audit is read-only; the remediation is not.
-- **`SecureBootDatabases` is confirmed on live hardware** for both generations (2026-10-27), by reading the Redfish endpoints manually: DL320 Gen11 (iLO 6, System ROM U63 v2.80) and DL380 Gen12 (iLO 7, System ROM U68 v1.52). Both returned PK=1, KEK=3, db=8 certificates including all four 2023 CAs and a `VMware Secure Boot Signing` entry in `db` — full list in the [certificate reference](docs/certificate-reference.md#hpe-platform-default-inventory-observed-live).
+- **Test the remediation script on a lab server first.** The v2.1 scripts have been exercised against the mock iLO in [`tests/mock-ilo`](tests/mock-ilo/README.md) on PowerShell 7 and Windows PowerShell 5.1 (remediation: `Verify`, preflight blocks and `-WhatIf` only). **They have not been run against a live iLO**, and that caveat stays until someone does so: in particular the session login (`POST SessionService/Sessions/` → `X-Auth-Token`) and the `ResetKeys` / `SecureBootEnable` writes are unproven on real hardware. The audit is read-only; the remediation is not.
+- **The Redfish read paths are confirmed on live hardware** for both generations (2026-10-27), by reading the endpoints manually (`.../SecureBoot/SecureBootDatabases/{PK|KEK|db|dbx}/Certificates/`, then each member): DL320 Gen11 (iLO 6, System ROM U63 v2.80) and DL380 Gen12 (iLO 7, System ROM U68 v1.52). Both returned PK=1, KEK=3, db=8 certificates including all four 2023 CAs and a `VMware Secure Boot Signing` entry in `db`; the scripts follow the same path. Full list in the [certificate reference](docs/certificate-reference.md#hpe-platform-default-inventory-observed-live). To repeat the read by hand (for example when a host shows `ERROR`), see the [runbook](docs/runbook.md#manual-spot-check-of-the-live-databases).
 - **The PCR indices ESXi seals its configuration against are unpublished.** Whether adding 2023 certificates to firmware `db` can break config unsealing on specific hardware is therefore untested. This is the highest-value lab test before a fleet rollout.
 
 ## Known gaps upstream

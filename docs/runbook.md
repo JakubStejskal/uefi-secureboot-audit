@@ -209,6 +209,38 @@ No firmware path exists. The last DL380 Gen9 System ROM (P89 v3.30, 2023-09-21) 
 - **iLO 6 1.62 added `DELETE` on certificates in the read-only Default databases.** Deleting entries from `dbDefault` or `KEKDefault` silently degrades the very defaults remediation depends on.
 - **Option ROM failures are OS-independent and look like missing hardware.** A card with a 2023-signed option ROM in a system without `Option ROM UEFI CA 2023` will not initialise and **disappears from RBSU** — it presents as a missing PCIe device, not a boot error.
 
+### Manual spot-check of the live databases
+
+Use this to see what the scripts see, for example when a host reports `ERROR` or `CertInventory` is not `OK`. It is read-only and reads the same endpoints as `HPE-SecureBootAudit.ps1`.
+
+```powershell
+$cred = Get-Credential
+$base = 'https://ilo-esx01.example.local'
+
+# Basic auth for a quick probe. The scripts use a Redfish session instead; Windows PowerShell 5.1
+# does not send -Credential preemptively, hence the explicit header.
+$pair = '{0}:{1}' -f $cred.UserName, $cred.GetNetworkCredential().Password
+$hdr  = @{ Authorization = 'Basic ' + [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($pair)) }
+
+foreach ($d in 'PK','KEK','db','dbx') {
+  try {
+    $coll = Invoke-RestMethod "$base/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/$d/Certificates/" -Headers $hdr
+    $names = foreach ($m in $coll.Members) {
+      $cert = if ($m.Subject) { $m } else { Invoke-RestMethod ($base + $m.'@odata.id') -Headers $hdr }
+      '{0} [exp {1}]' -f $cert.Subject.CommonName, $cert.ValidNotAfter
+    }
+    '{0} ({1}): {2}' -f $d, $coll.'Members@odata.count', ($names -join ' | ')
+  } catch {
+    '{0}: {1}' -f $d, $_.Exception.Message
+  }
+}
+```
+
+- The trailing `/` after `Certificates` is required; iLO answers `404` for a path with `//`, which is the bug v2.1 fixed.
+- iLO normally has a self-signed certificate. On PowerShell 7 add `-SkipCertificateCheck` to both `Invoke-RestMethod` calls. On Windows PowerShell 5.1 the certificate must be trusted, or you need a compiled `RemoteCertificateValidationCallback`, as in `Initialize-TlsBypass` in the scripts (a `{ $true }` scriptblock fails there).
+- Members of the `Certificates` collections contain only `@odata.id` on the tested platforms; the loop fetches each one.
+- Use a service account and do not paste the credential into tickets or chat.
+
 ---
 
 ## ESXi hosts
@@ -446,7 +478,7 @@ Do not mix deployment methods on the same device.
 
 ### Boot media
 
-WinPE, recovery and imaging media signed only by `Microsoft Windows Production PCA 2011` will stop receiving updates after 2026-10-19 and will not boot on 2023-only-`db` machines. Rebuild WinPE, backup rescue ISOs and PXE boot images.
+WinPE, recovery and imaging media signed only by `Microsoft Windows Production PCA 2011` cannot receive updates after the CA's expiry on 2026-10-19 and will not boot on 2023-only-`db` machines. Rebuild WinPE, backup rescue ISOs and PXE boot images.
 
 ---
 
@@ -488,6 +520,6 @@ Adding the 2023 CA to `db` is purely additive — the 2011 certificate stays and
 5. **Key reset + re-enable Secure Boot** in a maintenance window — three reboots per server.
 6. **Power-cycle VMs** so SilentPK applies the PK.
 7. **Windows in-guest servicing** — `AvailableUpdates = 0x5944`, run the task, confirm Event 1808.
-8. **Re-audit** and close out before **2026-10-19**.
+8. **Re-audit** and confirm every host reports `COMPLIANT`. The last 2011 CA expired on 2026-10-19, so any host that does not is an open item.
 
 Priority order if resources are limited: golden images and template pipelines first (that is where breakage actually originates), then anything that must receive future DBX revocations, then the long tail.

@@ -27,6 +27,22 @@
   5.1.26100 against the mock iLO; PowerShell 7 was never affected (per-call
   `-SkipCertificateCheck`).
 
+### Documentation
+
+- README: quick start (requirements, path through the tooling), verdict → next-step table, audit
+  output column reference, remediation checklist (recovery key, maintenance mode, `-WhatIf`,
+  what `BLOCKED` means, where the key backup is written, that reboots are manual).
+- Status line, timeline and rollout step 8 updated: `Microsoft Windows Production PCA 2011`
+  expired on 2026-10-19.
+- Runbook: manual read-only spot-check of the live databases.
+- "Before production" now separates what was confirmed on live iLOs (the Redfish read paths)
+  from what was not (the scripts themselves, the session login, the write calls).
+
+### CI
+
+- `actions/checkout` v4 → v7 (Node 24), runner pinned to `ubuntu-24.04`, `Install-Module`
+  retried up to three times (PSGallery intermittently answers "No match was found").
+
 ### Added
 
 - Audit columns: `SecureBootActive`, `CertInventoryNote`, `DbCounts`, `Has_PK`,
