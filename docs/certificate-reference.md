@@ -37,6 +37,40 @@ The PK still matters operationally: the KEK update payload must be signed by *th
 
 On vSphere, VMs created on ESXi before 9.0 carry `VMW.NULLPK` — a placeholder with a NULL signature — which blocks KEK authorisation entirely. See the [runbook](runbook.md#virtual-machines).
 
+## HPE platform-default inventory (observed live)
+
+Read through iLO Redfish (`/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/{PK|KEK|db|dbx}/Certificates/`) on **2026-10-27**:
+
+| Platform | iLO | System ROM |
+|---|---|---|
+| ProLiant DL320 Gen11 | iLO 6 | U63 v2.80 (01/29/2026) |
+| ProLiant Compute DL380 Gen12 | iLO 7 | U68 v1.52 (10/03/2025) |
+
+Both servers returned the **same** live certificate set (PK = 1, KEK = 3, db = 8, dbx = 3 certificates):
+
+| Database | CN | Expires |
+|---|---|---|
+| PK | `HPE UEFI Secure Boot 2016 PK Key` | 2031-01-30 |
+| KEK | `HPE UEFI Secure Boot 2016 KEK Key` | 2031-01-30 |
+| KEK | `Microsoft Corporation KEK CA 2011` | 2026-06-24 |
+| KEK | `Microsoft Corporation KEK 2K CA 2023` | 2038-03-02 |
+| db | `HP UEFI Secure Boot 2013 DB key` | 2033-08-23 |
+| db | `HPE UEFI Secure Boot 2016 DB Key` | 2031-01-30 |
+| db | `Microsoft Corporation UEFI CA 2011` | 2026-06-27 |
+| db | `Microsoft Windows Production PCA 2011` | 2026-10-19 |
+| db | `Microsoft UEFI CA 2023` | 2038-06-13 |
+| db | `Microsoft Option ROM UEFI CA 2023` | 2038-10-26 |
+| db | `Windows UEFI CA 2023` | 2035-06-13 |
+| db | **`VMware Secure Boot Signing`** | 2037-10-19 |
+| dbx | `Canonical Ltd. Secure Boot Signing`, `Virtual UEFI SubCA`, `Debian Secure Boot Signer` | — |
+
+Notes:
+
+- The 2011 CAs are still present next to the 2023 ones, as intended — see [do not remove the 2011 CA](runbook.md#what-actually-breaks).
+- `dbx` mostly holds SHA-256 hashes (`.../dbx/Signatures`); the scripts read only its certificate entries.
+- Members of the `Certificates` collections contain only `@odata.id`; `$expand` is not honoured, so each certificate is fetched individually.
+- `VMware Secure Boot Signing` is a platform-default `db` entry on both generations. The runbook names the same CN as the signer of ESXi VIBs. Whether the ESXi *bootloader* on these platforms is trusted through this entry instead of the Microsoft third-party CA has **not been verified** — do not read a lower host risk out of it until the Authenticode signer chain of the ESXi boot files has been checked.
+
 ## Signature owner GUIDs for manual enrolment
 
 | Vendor | GUID |

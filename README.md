@@ -174,7 +174,7 @@ Three stages, each requiring a reboot in between.
 .\scripts\HPE-SecureBootRemediate.ps1 -ILOHost ilo-esx01 -Credential $cred -Stage Verify -SkipCertificateCheck
 ```
 
-Preflight **blocks** the reset when the System ROM is below baseline (a reset would restore 2011-only defaults — a silent regression), and on Gen12 and Gen9 where it is pointless or harmful. `-Force` overrides; the block exists for a reason.
+Preflight **blocks** the reset when the System ROM is below baseline (a reset would restore 2011-only defaults — a silent regression), when the live `KEK` and `db` already hold all four 2023 certificates (it would gain nothing, disable Secure Boot and discard custom keys), and on Gen12 and Gen9 where it is pointless or harmful. `-Force` overrides; the block exists for a reason. `EnableSecureBoot` warns when no PK is enrolled (SetupMode enforces nothing).
 
 Before the reset, all readable certificates are exported to `.\secureboot-backup\<host>_<timestamp>\` as PEM plus a JSON manifest. The script refuses iLO 5 servers outright (not overridable with `-Force`).
 
@@ -211,8 +211,8 @@ Windows in-guest details, event IDs and Linux guidance are in the [runbook](docs
 ## Before production
 
 - **Verify the ROM baselines against the current advisory revision.** HPE revised a00156355en_us five times between January and July 2026. The values here are from rev. 5.
-- **Test the remediation script on a lab server first.** Redfish calls have not been executed against live hardware from this repository; the logic is unit-tested, the wire calls are not.
-- **`SecureBootDatabases` is confirmed on live hardware** for both generations (2026-10-27): DL320 Gen11 (iLO 6, System ROM U63 v2.80) and DL380 Gen12 (iLO 7, System ROM U68 v1.52). Both returned PK=1, KEK=3, db=8 certificates including all four 2023 CAs and a `VMware Secure Boot Signing` entry in `db`.
+- **Test the remediation script on a lab server first.** The v2.1 scripts have been exercised against the mock iLO in [`tests/mock-ilo`](tests/mock-ilo/README.md) on PowerShell 7 and Windows PowerShell 5.1 (remediation: `Verify`, preflight blocks and `-WhatIf` only), not yet against live hardware. The audit is read-only; the remediation is not.
+- **`SecureBootDatabases` is confirmed on live hardware** for both generations (2026-10-27), by reading the Redfish endpoints manually: DL320 Gen11 (iLO 6, System ROM U63 v2.80) and DL380 Gen12 (iLO 7, System ROM U68 v1.52). Both returned PK=1, KEK=3, db=8 certificates including all four 2023 CAs and a `VMware Secure Boot Signing` entry in `db` — full list in the [certificate reference](docs/certificate-reference.md#hpe-platform-default-inventory-observed-live).
 - **The PCR indices ESXi seals its configuration against are unpublished.** Whether adding 2023 certificates to firmware `db` can break config unsealing on specific hardware is therefore untested. This is the highest-value lab test before a fleet rollout.
 
 ## Known gaps upstream

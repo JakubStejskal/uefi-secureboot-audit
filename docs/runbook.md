@@ -85,6 +85,8 @@ In practice **any 2026 SPP** satisfies the Gen11 baseline: bundle 2026.05.00.00 
 | iLO 6 | Gen11 | ✅ | ✅ | ✅ since v1.10 |
 | iLO 7 | Gen12 | ✅ | ✅ | ✅ since v1.11 |
 
+`SecureBootDatabases` was read successfully on a live DL320 Gen11 (iLO 6) and a live DL380 Gen12 (iLO 7) on 2026-10-27 — inventory in the [certificate reference](certificate-reference.md#hpe-platform-default-inventory-observed-live).
+
 iLO 5 servers are out of scope for the tooling — see [Servers with iLO 5](#servers-with-ilo-5-gen10--gen10-plus--manual-procedure).
 
 ### A ROM update alone changes nothing
@@ -108,6 +110,15 @@ $cred = Get-Credential
 .\scripts\HPE-SecureBootAudit.ps1 -InputCsv .\examples\fleet.csv -Credential $cred `
     -SkipCertificateCheck -OutputCsv .\hpe-audit.csv
 ```
+
+`COMPLIANT` is only issued after the live `KEK` and `db` were read: `KEK 2K CA 2023` in `KEK`, the three 2023 CAs in `db`, Secure Boot enforcing (PK present, `UserMode`). Everything else needs a look — the summary prints the reason for every non-compliant host, and the `Missing2023`, `CertInventoryNote` and `Error` columns carry the detail. Verdict meanings are in the [README](../README.md#audit-an-hpe-fleet); the ones you will act on:
+
+| Verdict | Next step |
+|---|---|
+| `NEEDS_ROM_AND_RESET` | Flash System ROM (step 4), then reset keys |
+| `NEEDS_KEY_RESET` | Reset keys (step 5) |
+| `CERTS_OK_SECUREBOOT_OFF` | Certificates are complete; re-enable Secure Boot (step 6). If `Has_PK` is `False` the platform is in SetupMode — reset keys first |
+| `ROM_OK_CERTS_UNKNOWN` (Gen11) / `UNVERIFIED` (Gen12) | Live databases could not be read. Check `CertInventoryNote`, then verify in RBSU (*Advanced Secure Boot Options → View entries*) or the Embedded UEFI Shell |
 
 **2. Capture rollback state**
 
@@ -146,7 +157,9 @@ Or:
 
 `ResetKeysType` accepts exactly three values: `ResetAllKeysToDefault`, `DeleteAllKeys`, `DeletePK`. There is no `ResetPK`. The latter two put the system into Setup Mode and will leave it unbootable with Secure Boot enabled.
 
-**6. Re-enable Secure Boot**, then reboot. The reset turned it off.
+The script's preflight **blocks** the reset when the System ROM is below baseline and when the live `KEK` and `db` already contain all four 2023 certificates (a reset would gain nothing, disable Secure Boot and discard custom keys). `-Force` overrides; use `-WhatIf` first.
+
+**6. Re-enable Secure Boot**, then reboot. The reset turned it off. The script warns if no PK is enrolled: in SetupMode `SecureBootEnable = true` is accepted but nothing is enforced, so run the key reset first.
 
 ```http
 PATCH /redfish/v1/Systems/1/SecureBoot
@@ -155,7 +168,7 @@ PATCH /redfish/v1/Systems/1/SecureBoot
 
 **7. Verify**
 
-- Redfish inventory — all four 2023 certificates
+- `-Stage Verify` (or re-run the audit): `Microsoft Corporation KEK 2K CA 2023` in `KEK` and `Windows UEFI CA 2023`, `Microsoft UEFI CA 2023`, `Microsoft Option ROM UEFI CA 2023` in `db` — each checked in its own database, a hit in `dbx` does not count. The audit should now return `COMPLIANT`; `CERTS_OK_SECUREBOOT_OFF` means the certificates are there but Secure Boot is not enforcing yet (step 6 missing)
 - ESXi: run `/sbin/auto-backup.sh` once the host is up, or the configuration is not re-sealed
 
 **8. Re-enrol custom keys** that step 5 destroyed.
@@ -180,7 +193,9 @@ HPE does not document whether a `db`-only reset keeps Secure Boot enabled or lea
 
 ### Gen12
 
-Skip steps 2–6, 8. Advisory rev. 5: the certificates are *"included and enabled for all HPE Gen12 platforms since its first original BIOS release; therefore, the action to 'Reset All Keys to Platform Defaults' **is not required**."* Performing the reset gains nothing and discards any custom keys.
+Skip steps 2–6, 8 **if the audit returns `COMPLIANT`**. Advisory rev. 5: the certificates are *"included and enabled for all HPE Gen12 platforms since its first original BIOS release; therefore, the action to 'Reset All Keys to Platform Defaults' **is not required**."* Performing the reset gains nothing and discards any custom keys.
+
+The audit does not take that on trust: Gen12 is judged from the live databases like Gen11. `UNVERIFIED` means they could not be read — verify in RBSU. `NEEDS_KEY_RESET` on a Gen12 server means the keys were customised or replaced after the factory state; compare with `dbDefault` / `KEKDefault` before resetting.
 
 ### Gen9
 
@@ -189,7 +204,7 @@ No firmware path exists. The last DL380 Gen9 System ROM (P89 v3.30, 2023-09-21) 
 ### Known traps
 
 - **HPE's own option ROM signing certificate lives in the default `db`.** Hand-curating the database instead of resetting to defaults, and dropping the HPE entry, means Smart Array and NIC option ROMs will not load and the server will not boot with Secure Boot enabled.
-- **HPE prunes expired vendor certificates from defaults.** Older ROMs, e.g. 3.50 (2025-04): *"Removed Expired SUSE and Vmware Certificates."* If you depend on them, a reset removes them.
+- **HPE prunes expired vendor certificates from defaults.** Older ROMs, e.g. 3.50 (2025-04): *"Removed Expired SUSE and Vmware Certificates."* If you depend on them, a reset removes them. The platform-default `db` observed on 2026-10-27 does contain a current `VMware Secure Boot Signing` entry (valid to 2037) — see the [certificate reference](certificate-reference.md#hpe-platform-default-inventory-observed-live).
 - **iLO 6 1.61 ↔ 1.62 requires a server reboot** in either direction, or the BIOS and iLO Secure Boot databases desynchronise.
 - **iLO 6 1.62 added `DELETE` on certificates in the read-only Default databases.** Deleting entries from `dbDefault` or `KEKDefault` silently degrades the very defaults remediation depends on.
 - **Option ROM failures are OS-independent and look like missing hardware.** A card with a 2023-signed option ROM in a system without `Option ROM UEFI CA 2023` will not initialise and **disappears from RBSU** — it presents as a missing PCIe device, not a boot error.
