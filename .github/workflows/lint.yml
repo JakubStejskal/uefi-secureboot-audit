@@ -9,13 +9,24 @@ on:
 jobs:
   psscriptanalyzer:
     name: PSScriptAnalyzer
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install PSScriptAnalyzer
         shell: pwsh
-        run: Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+        run: |
+          # PSGallery occasionally answers "No match was found"; retry before failing.
+          for ($i = 1; $i -le 3; $i++) {
+              try {
+                  Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -ErrorAction Stop
+                  break
+              } catch {
+                  if ($i -eq 3) { throw }
+                  Write-Host "Install-Module failed (attempt $i): $($_.Exception.Message)"
+                  Start-Sleep -Seconds (10 * $i)
+              }
+          }
 
       - name: Parse check
         shell: pwsh
