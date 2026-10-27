@@ -63,7 +63,7 @@
     reboots per server.
 
 .PARAMETER ILOHost
-    iLO hostname / IP.
+    iLO hostname / IP. A scheme, path or trailing slash is stripped.
 
 .PARAMETER Credential
     iLO account with 'Configure iLO Settings' privilege (required for POST/PATCH).
@@ -96,7 +96,7 @@
 
 .NOTES
     Project : uefi-secureboot-audit
-    Version : 2.0
+    Version : 2.1
     Licence : MIT. Provided as-is, with no warranty. Not affiliated with, endorsed by,
               or supported by HPE, Broadcom or Microsoft. Always validate on a lab
               server before touching production.
@@ -151,6 +151,30 @@ function Get-Prop {
         return $v
     }
     return $Default
+}
+
+function ConvertTo-ILOHostName {
+    param([Parameter(Mandatory)][string]$Value)
+    $h = $Value.Trim() -replace '^[A-Za-z][A-Za-z0-9+.\-]*://', ''
+    $h = ($h -split '/')[0]
+    if ([string]::IsNullOrWhiteSpace($h)) { throw "Invalid iLO host value '$Value'." }
+    return $h
+}
+function Join-RedfishUri {
+    # iLO @odata.id values end with '/'; naive "$uri/Child" produces '//Child'.
+    param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][string]$Path)
+    if ($Path -match '^https?://') { return $Path }
+    return ($Base.TrimEnd('/') + '/' + $Path.TrimStart('/'))
+}
+function Resolve-RedfishLink {
+    param($Conn, $Object, [string]$Name)
+    $id = Get-Prop (Get-Prop $Object $Name) '@odata.id'
+    if ($id) { return (Join-RedfishUri -Base $Conn.Base -Path $id) }
+    return $null
+}
+function Get-ODataLeaf {
+    param([string]$ODataId)
+    return (($ODataId.TrimEnd('/')) -split '/')[-1]
 }
 
 function Invoke-Redfish {
@@ -211,12 +235,12 @@ function Disconnect-ILO {
 function Get-Context {
     param($Conn)
     $mgrCol = Invoke-Redfish -Uri "$($Conn.Base)/redfish/v1/Managers/" -Headers $Conn.Headers
-    $mgr    = Invoke-Redfish -Uri "$($Conn.Base)$($mgrCol.Members[0].'@odata.id')" -Headers $Conn.Headers
+    $mgr    = Invoke-Redfish -Uri (Join-RedfishUri -Base $Conn.Base -Path $mgrCol.Members[0].'@odata.id') -Headers $Conn.Headers
     $iloTag = "$(Get-Prop $mgr 'Model' '')$(Get-Prop $mgr 'FirmwareVersion' '')"
     $iloGen = if ($iloTag -match 'iLO\s*(\d)') { [int]$Matches[1] } else { 0 }
 
     $sysCol = Invoke-Redfish -Uri "$($Conn.Base)/redfish/v1/Systems/" -Headers $Conn.Headers
-    $sysUri = "$($Conn.Base)$($sysCol.Members[0].'@odata.id')"
+    $sysUri = Join-RedfishUri -Base $Conn.Base -Path $sysCol.Members[0].'@odata.id'
     $sys    = Invoke-Redfish -Uri $sysUri -Headers $Conn.Headers
 
     $model = [string](Get-Prop $sys 'Model' '')
@@ -236,11 +260,19 @@ function Get-Context {
     $req = $null
     if ($script:RomBaseline.ContainsKey("$gen|$arch")) { $req = [version]$script:RomBaseline["$gen|$arch"] }
 
-    $sb = Invoke-Redfish -Uri "$sysUri/SecureBoot" -Headers $Conn.Headers -AllowNotFound
+    $sbUri = Resolve-RedfishLink -Conn $Conn -Object $sys -Name 'SecureBoot'
+    if (-not $sbUri) { $sbUri = Join-RedfishUri -Base $sysUri -Path 'SecureBoot/' }
+    $sb = Invoke-Redfish -Uri $sbUri -Headers $Conn.Headers -AllowNotFound
+
+    # Action target as advertised by iLO; fall back to the conventional path.
+    $resetTarget = Get-Prop (Get-Prop (Get-Prop $sb 'Actions') '#SecureBoot.ResetKeys') 'target'
+    $resetUri = if ($resetTarget) { Join-RedfishUri -Base $Conn.Base -Path $resetTarget }
+                else { Join-RedfishUri -Base $sbUri -Path 'Actions/SecureBoot.ResetKeys/' }
 
     [pscustomobject]@{
         SystemUri     = $sysUri
-        SecureBootUri = "$sysUri/SecureBoot"
+        SecureBootUri = $sbUri
+        ResetKeysUri  = $resetUri
         Model         = $model
         Serial        = [string](Get-Prop $sys 'SerialNumber' '')
         PowerState    = [string](Get-Prop $sys 'PowerState' '')
@@ -255,27 +287,50 @@ function Get-Context {
 }
 
 function Get-CertInventory {
-    param($Conn, [string]$SecureBootUri)
-    $dbCol = Invoke-Redfish -Uri "$SecureBootUri/SecureBootDatabases" -Headers $Conn.Headers -AllowNotFound
+    <# Live PK/KEK/db/dbx certificates via @odata.id links; $null when not exposed. #>
+    param($Conn, $SecureBoot, [string]$SecureBootUri)
+    $dbColUri = Resolve-RedfishLink -Conn $Conn -Object $SecureBoot -Name 'SecureBootDatabases'
+    if (-not $dbColUri) { $dbColUri = Join-RedfishUri -Base $SecureBootUri -Path 'SecureBootDatabases/' }
+    $dbCol = Invoke-Redfish -Uri $dbColUri -Headers $Conn.Headers -AllowNotFound
     if (-not $dbCol -or -not ($dbCol.PSObject.Properties.Name -contains 'Members')) { return $null }
     $out = New-Object System.Collections.Generic.List[object]
     foreach ($m in $dbCol.Members) {
-        $id = ($m.'@odata.id' -split '/')[-1]
+        $id = Get-ODataLeaf $m.'@odata.id'
         if ($id -match 'Default$' -or $id -notin 'PK', 'KEK', 'db', 'dbx') { continue }
-        $cc = Invoke-Redfish -Uri "$($Conn.Base)$($m.'@odata.id')/Certificates" -Headers $Conn.Headers -AllowNotFound
+        $dbUri = Join-RedfishUri -Base $Conn.Base -Path $m.'@odata.id'
+        $db    = Invoke-Redfish -Uri $dbUri -Headers $Conn.Headers -AllowNotFound
+        $ccUri = Resolve-RedfishLink -Conn $Conn -Object $db -Name 'Certificates'
+        if (-not $ccUri) { $ccUri = Join-RedfishUri -Base $dbUri -Path 'Certificates/' }
+        $cc = Invoke-Redfish -Uri $ccUri -Headers $Conn.Headers -AllowNotFound
         if (-not $cc -or -not ($cc.PSObject.Properties.Name -contains 'Members')) { continue }
         foreach ($cm in $cc.Members) {
-            $c = Invoke-Redfish -Uri "$($Conn.Base)$($cm.'@odata.id')" -Headers $Conn.Headers -AllowNotFound
+            $c = if (Get-Prop $cm 'Subject') { $cm }
+                 else { Invoke-Redfish -Uri (Join-RedfishUri -Base $Conn.Base -Path $cm.'@odata.id') -Headers $Conn.Headers -AllowNotFound }
             if (-not $c) { continue }
             $out.Add([pscustomobject]@{
                 Database   = $id
-                CommonName = [string](Get-Prop (Get-Prop $c 'Subject') 'CommonName')
+                CommonName = ([string](Get-Prop (Get-Prop $c 'Subject') 'CommonName')).Trim()
                 NotAfter   = Get-Prop $c 'ValidNotAfter'
                 Pem        = Get-Prop $c 'CertificateString'
             })
         }
     }
     return $out.ToArray()
+}
+
+function Get-Missing2023 {
+    <# Each 2023 certificate must be in its own live database; dbx does not count. #>
+    param($Certs)
+    $want = @(
+        @{ Db = 'KEK'; CN = 'Microsoft Corporation KEK 2K CA 2023' }
+        @{ Db = 'db';  CN = 'Windows UEFI CA 2023' }
+        @{ Db = 'db';  CN = 'Microsoft UEFI CA 2023' }
+        @{ Db = 'db';  CN = 'Microsoft Option ROM UEFI CA 2023' }
+    )
+    @($want | Where-Object {
+        $w = $_
+        -not @($Certs | Where-Object { $_.Database -eq $w.Db -and $_.CommonName -eq $w.CN }).Count
+    } | ForEach-Object { '{0}:{1}' -f $_.Db, $_.CN })
 }
 
 function Save-KeyBackup {
@@ -298,13 +353,18 @@ Export the keys manually before proceeding (RBSU -> Server Security -> Secure Bo
         $safe = ($c.CommonName -replace '[^\w\.\- ]', '_')
         $c.Pem | Set-Content -Path (Join-Path $dir ('{0:D2}_{1}_{2}.pem' -f $i, $c.Database, $safe)) -Encoding ASCII
     }
-    Write-Host "Key backup written to: $dir" -ForegroundColor Green
+    if ($WhatIfPreference) { Write-Host "WhatIf: key backup would be written to: $dir" -ForegroundColor Cyan }
+    else { Write-Host "Key backup written to: $dir" -ForegroundColor Green }
     return $dir
 }
 
 function Test-Preflight {
-    param($Ctx)
+    param($Ctx, $Certs)
     $blocks = @(); $warns = @()
+
+    if ($Certs -and @($Certs).Count -gt 0 -and @(Get-Missing2023 -Certs $Certs).Count -eq 0) {
+        $blocks += 'The live KEK and db already contain all four 2023 certificates. A reset gains nothing, disables Secure Boot and discards any custom keys.'
+    }
 
     if ($Ctx.Generation -eq 'Gen12') {
         $blocks += 'Gen12 already has the 2023 certificates enabled from the factory. A reset gains nothing and discards any custom keys.'
@@ -329,6 +389,7 @@ function Test-Preflight {
 $conn = $null
 try {
     Initialize-TlsBypass
+    $ILOHost = ConvertTo-ILOHostName -Value $ILOHost
     $conn = Connect-ILO -HostName $ILOHost
     $ctx  = Get-Context -Conn $conn
     if ($ctx.Generation -in 'Gen10', 'Gen10 Plus') {
@@ -351,7 +412,7 @@ try {
     Write-Host ''
 
     $certs = $null
-    if ($ctx.ILOGeneration -ge 6) { $certs = Get-CertInventory -Conn $conn -SecureBootUri $ctx.SecureBootUri }
+    if ($ctx.ILOGeneration -ge 6 -and $ctx.SecureBoot) { $certs = Get-CertInventory -Conn $conn -SecureBoot $ctx.SecureBoot -SecureBootUri $ctx.SecureBootUri }
 
     switch ($Stage) {
 
@@ -363,14 +424,18 @@ try {
                 break
             }
             $certs | Sort-Object Database, CommonName | Format-Table Database, CommonName, NotAfter -AutoSize
-            $cns = @($certs | ForEach-Object { $_.CommonName })
-            $missing = @($script:Required2023 | Where-Object { $cns -notcontains $_ })
-            if ($missing.Count -eq 0) { Write-Host 'All four 2023 certificates are present.' -ForegroundColor Green }
+            $missing = @(Get-Missing2023 -Certs $certs)
+            if ($missing.Count -eq 0) { Write-Host 'All four 2023 certificates are present in their live databases (KEK / db).' -ForegroundColor Green }
             else { Write-Host "MISSING: $($missing -join ', ')" -ForegroundColor Yellow }
+            $pkCount = @($certs | Where-Object { $_.Database -eq 'PK' }).Count
+            $cur     = Get-Prop $ctx.SecureBoot 'SecureBootCurrentBoot'
+            if ($pkCount -eq 0 -or $cur -ne 'Enabled') {
+                Write-Host "Secure Boot NOT enforcing: PK entries=$pkCount, CurrentBoot=$cur. Run -Stage EnableSecureBoot (and reset keys first if PK is missing)." -ForegroundColor Yellow
+            }
         }
 
         'ResetKeys' {
-            $pf = Test-Preflight -Ctx $ctx
+            $pf = Test-Preflight -Ctx $ctx -Certs $certs
             foreach ($w in $pf.Warnings) { Write-Warning $w }
             if ($pf.Blocks.Count -gt 0) {
                 foreach ($b in $pf.Blocks) { Write-Host "BLOCKED: $b" -ForegroundColor Red }
@@ -388,7 +453,7 @@ try {
             Write-Host ''
 
             if ($PSCmdlet.ShouldProcess("$ILOHost ($($ctx.Model))", 'SecureBoot.ResetKeys = ResetAllKeysToDefault')) {
-                $uri = "$($ctx.SecureBootUri)/Actions/SecureBoot.ResetKeys"
+                $uri = $ctx.ResetKeysUri
                 $res = Invoke-Redfish -Uri $uri -Headers $conn.Headers -Method POST -Body @{ ResetKeysType = 'ResetAllKeysToDefault' }
                 Write-Host 'ResetKeys submitted. The BIOS applies it at the next POST.' -ForegroundColor Green
                 Write-Host 'NEXT: reboot the server, then run -Stage EnableSecureBoot.' -ForegroundColor Cyan
@@ -397,6 +462,10 @@ try {
         }
 
         'EnableSecureBoot' {
+            if ($certs -and @($certs | Where-Object { $_.Database -eq 'PK' }).Count -eq 0) {
+                # Without a PK the platform stays in SetupMode: SecureBootEnable=true is accepted but nothing is enforced.
+                Write-Warning 'No PK enrolled (SetupMode). Enabling Secure Boot will not enforce anything until a PK exists - run -Stage ResetKeys first.'
+            }
             if ((Get-Prop $ctx.SecureBoot 'SecureBootEnable') -eq $true) {
                 Write-Host 'SecureBootEnable is already true - nothing to do.' -ForegroundColor Green
                 break

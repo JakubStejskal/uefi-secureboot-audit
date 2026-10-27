@@ -16,10 +16,22 @@
     is passed in, it is reported as OUT_OF_SCOPE and nothing else is evaluated.
 
     Where the certificate inventory is unavailable on an in-scope server, the script
-    reports ROM_OK_CERTS_UNKNOWN rather than claiming compliance it cannot prove.
+    reports ROM_OK_CERTS_UNKNOWN (Gen11) or UNVERIFIED (Gen12) rather than claiming
+    compliance it cannot prove. No verdict of COMPLIANT is ever issued without the
+    live KEK and db having been read.
+
+    Every 2023 certificate is checked in the database it belongs to (KEK 2023 in KEK,
+    the three CAs in db). A certificate found only in dbx counts as revoked, not present.
+
+    Navigation follows the @odata.id links iLO returns instead of concatenating paths.
+    iLO member links end with '/': in v2.0 "$sysUri/SecureBoot" produced
+    '.../Systems/1//SecureBoot' (rejected, swallowed as 404/400 -> NOT_REPORTED), and
+    splitting '.../SecureBootDatabases/db/' on '/' yielded an empty database ID, so
+    every live database would have been skipped even with a correct URI.
 
 .PARAMETER ILOHost
-    One or more iLO hostnames / IP addresses.
+    One or more iLO hostnames / IP addresses. A scheme, path or trailing slash
+    ('https://10.0.0.5/') is stripped, so pasted URLs work.
 
 .PARAMETER InputCsv
     CSV file with an 'ILOHost' column (an optional 'Note' column is ignored).
@@ -48,20 +60,27 @@
 
 .OUTPUTS
     One PSCustomObject per target. Verdict is one of:
-        COMPLIANT             all four 2023 certificates present (or Gen12)
-        NEEDS_KEY_RESET       ROM meets baseline, live databases still lack 2023 certs
-        NEEDS_ROM_AND_RESET   System ROM below advisory baseline
-        ROM_OK_CERTS_UNKNOWN  ROM is fine, but iLO did not report a certificate inventory
-        OUT_OF_SCOPE          iLO 5 server - no remote audit possible, see docs/runbook.md
-        NOT_SUPPORTED         Gen9 - no firmware path exists
-        ERROR                 unreachable / auth failure / unexpected response
+        COMPLIANT               KEK 2023 in KEK and all three 2023 CAs in db, read from
+                                the live databases, Secure Boot active (UserMode)
+        CERTS_OK_SECUREBOOT_OFF certificates complete, but Secure Boot is not enforcing
+                                (disabled, or PK missing / SetupMode)
+        NEEDS_KEY_RESET         live databases lack 2023 certs; ROM meets baseline
+                                (Gen11) or is factory-capable (Gen12)
+        NEEDS_ROM_AND_RESET     live databases lack 2023 certs and System ROM is below
+                                the advisory baseline
+        ROM_OK_CERTS_UNKNOWN    Gen11: ROM meets baseline, live databases not readable
+        UNVERIFIED              Gen12: live databases not readable (see CertInventoryNote)
+        OUT_OF_SCOPE            iLO 5 server - no remote audit possible, see docs/runbook.md
+        NOT_SUPPORTED           Gen9 - no firmware path exists
+        UNKNOWN                 generation or ROM version could not be determined
+        ERROR                   unreachable / auth failure / unexpected response (see Error)
 
 .LINK
     https://support.hpe.com/hpesc/public/docDisplay?docId=a00156355en_us
 
 .NOTES
     Project : uefi-secureboot-audit
-    Version : 2.0
+    Version : 2.1
     Licence : MIT. Provided as-is, with no warranty. Not affiliated with, endorsed by,
               or supported by HPE, Broadcom or Microsoft. Validate against the current
               revision of the HPE advisory and test in a lab before fleet use.
@@ -164,6 +183,42 @@ function Get-Prop {
         return $v
     }
     return $Default
+}
+
+function ConvertTo-ILOHostName {
+    <#
+      'https://10.0.0.5/', '10.0.0.5/redfish/v1', ' ilo01 ' -> '10.0.0.5' / 'ilo01'.
+      Port and IPv6 literals ('[fe80::1]:443') are preserved.
+    #>
+    param([Parameter(Mandatory)][string]$Value)
+    $h = $Value.Trim() -replace '^[A-Za-z][A-Za-z0-9+.\-]*://', ''
+    $h = ($h -split '/')[0]
+    if ([string]::IsNullOrWhiteSpace($h)) { throw "Invalid iLO host value '$Value'." }
+    return $h
+}
+
+function Join-RedfishUri {
+    <#
+      Joins a base and a path with exactly one '/'. iLO @odata.id values end with '/',
+      so naive "$uri/Child" produces '//Child' and iLO answers 404.
+    #>
+    param([Parameter(Mandatory)][string]$Base, [Parameter(Mandatory)][string]$Path)
+    if ($Path -match '^https?://') { return $Path }
+    return ($Base.TrimEnd('/') + '/' + $Path.TrimStart('/'))
+}
+
+function Resolve-RedfishLink {
+    <# Absolute URI of a navigation property { "@odata.id": "..." }, or $null. #>
+    param($Conn, $Object, [string]$Name)
+    $id = Get-Prop (Get-Prop $Object $Name) '@odata.id'
+    if ($id) { return (Join-RedfishUri -Base $Conn.Base -Path $id) }
+    return $null
+}
+
+function Get-ODataLeaf {
+    <# '/redfish/v1/Systems/1/SecureBoot/SecureBootDatabases/db/' -> 'db' #>
+    param([string]$ODataId)
+    return (($ODataId.TrimEnd('/')) -split '/')[-1]
 }
 
 function Invoke-Redfish {
@@ -270,13 +325,13 @@ function Get-SystemUri {
     param($Conn)
     $col = Invoke-Redfish -Uri "$($Conn.Base)/redfish/v1/Systems/" -Headers $Conn.Headers
     if (-not $col.Members -or $col.Members.Count -eq 0) { throw 'ComputerSystem collection is empty.' }
-    return "$($Conn.Base)$($col.Members[0].'@odata.id')"
+    return (Join-RedfishUri -Base $Conn.Base -Path $col.Members[0].'@odata.id')
 }
 
 function Get-ManagerInfo {
     param($Conn)
     $col = Invoke-Redfish -Uri "$($Conn.Base)/redfish/v1/Managers/" -Headers $Conn.Headers
-    $mgr = Invoke-Redfish -Uri "$($Conn.Base)$($col.Members[0].'@odata.id')" -Headers $Conn.Headers
+    $mgr = Invoke-Redfish -Uri (Join-RedfishUri -Base $Conn.Base -Path $col.Members[0].'@odata.id') -Headers $Conn.Headers
 
     $model = [string](Get-Prop $mgr 'Model' '')
     $fw    = [string](Get-Prop $mgr 'FirmwareVersion' '')
@@ -328,34 +383,72 @@ function Get-RequiredRomVersion {
 
 function Get-SecureBootCertificateInventory {
     <#
-      Returns an array of Database/CommonName/NotAfter/Serial objects, or $null when
-      SecureBootDatabases is absent. $null is an expected state, not a fault.
+      Reads the live PK / KEK / db / dbx certificate collections.
+
+      Returns @{ Status; Note; Certs } where Status is:
+        OK            every collection and every certificate read
+        PARTIAL       some certificate reads failed (see Note); Certs holds what was read
+        EMPTY         collections exist but contain no certificates
+        NOT_REPORTED  SecureBootDatabases or the live databases are absent (see Note)
 
       Only live databases are read. The read-only *Default collections hold the OEM
-      defaults that a key reset would apply, not what the platform is using now.
+      defaults a key reset would apply, not what the platform is using now.
+
+      dbx mostly holds SHA-256 hashes; those are in .../dbx/Signatures and are not
+      read here. Only certificate entries in dbx are reported.
     #>
-    param($Conn, [string]$SecureBootUri)
+    param($Conn, $SecureBoot, [string]$SecureBootUri)
 
-    $dbCol = Invoke-Redfish -Uri "$SecureBootUri/SecureBootDatabases" -Headers $Conn.Headers -AllowNotFound
-    if (-not $dbCol) { return $null }
-    if (-not ($dbCol.PSObject.Properties.Name -contains 'Members')) { return $null }
-
+    $notes  = New-Object System.Collections.Generic.List[string]
     $result = New-Object System.Collections.Generic.List[object]
+    $failed = 0
 
+    $dbColUri = Resolve-RedfishLink -Conn $Conn -Object $SecureBoot -Name 'SecureBootDatabases'
+    if (-not $dbColUri) {
+        $dbColUri = Join-RedfishUri -Base $SecureBootUri -Path 'SecureBootDatabases/'
+        $notes.Add('SecureBoot resource has no SecureBootDatabases link; tried the conventional path.')
+    }
+
+    $dbCol = Invoke-Redfish -Uri $dbColUri -Headers $Conn.Headers -AllowNotFound
+    if (-not $dbCol -or -not ($dbCol.PSObject.Properties.Name -contains 'Members')) {
+        $notes.Add("No SecureBootDatabases collection at $dbColUri.")
+        return [pscustomobject]@{ Status = 'NOT_REPORTED'; Note = ($notes -join ' '); Certs = @() }
+    }
+
+    $liveSeen = 0
     foreach ($m in $dbCol.Members) {
-        $dbUri = "$($Conn.Base)$($m.'@odata.id')"
-        $dbId  = ($m.'@odata.id' -split '/')[-1]
+        $dbUri = Join-RedfishUri -Base $Conn.Base -Path $m.'@odata.id'
+        $dbId  = Get-ODataLeaf $m.'@odata.id'
 
         if ($dbId -match 'Default$') { continue }
         if ($dbId -notin 'PK', 'KEK', 'db', 'dbx') { continue }
+        $liveSeen++
 
-        $certCol = Invoke-Redfish -Uri "$dbUri/Certificates" -Headers $Conn.Headers -AllowNotFound
-        if (-not $certCol -or -not ($certCol.PSObject.Properties.Name -contains 'Members')) { continue }
+        # Prefer the Certificates link from the database resource; fall back to the path.
+        $certColUri = $null
+        try {
+            $db = Invoke-Redfish -Uri $dbUri -Headers $Conn.Headers -AllowNotFound
+            if ($db) {
+                $certColUri = Resolve-RedfishLink -Conn $Conn -Object $db -Name 'Certificates'
+                $idProp = [string](Get-Prop $db 'DatabaseId')
+                if ($idProp) { $dbId = $idProp }
+            }
+        }
+        catch { $notes.Add("Read of $dbId failed: $($_.Exception.Message)"); $failed++ }
+        if (-not $certColUri) { $certColUri = Join-RedfishUri -Base $dbUri -Path 'Certificates/' }
+
+        $certCol = Invoke-Redfish -Uri $certColUri -Headers $Conn.Headers -AllowNotFound
+        if (-not $certCol -or -not ($certCol.PSObject.Properties.Name -contains 'Members')) {
+            $notes.Add("$dbId has no Certificates collection.")
+            continue
+        }
 
         foreach ($cm in $certCol.Members) {
             try {
-                $cert = Invoke-Redfish -Uri "$($Conn.Base)$($cm.'@odata.id')" -Headers $Conn.Headers -AllowNotFound
-                if (-not $cert) { continue }
+                # Some firmware embeds the members ($expand); otherwise fetch each one.
+                $cert = if (Get-Prop $cm 'Subject') { $cm }
+                        else { Invoke-Redfish -Uri (Join-RedfishUri -Base $Conn.Base -Path $cm.'@odata.id') -Headers $Conn.Headers -AllowNotFound }
+                if (-not $cert) { $failed++; continue }
 
                 $subj = Get-Prop $cert 'Subject'
                 $cn   = [string](Get-Prop $subj 'CommonName')
@@ -365,9 +458,7 @@ function Get-SecureBootCertificateInventory {
                 $raw = Get-Prop $cert 'ValidNotAfter'
                 if ($raw) { try { $na = [datetime]$raw } catch { $na = $null } }
 
-                # Fallback: some iLO firmware omits Subject / ValidNotAfter. HPE's
-                # Certificate schema also has no Fingerprint property for Secure Boot
-                # databases, so any thumbprint work has to start from the PEM anyway.
+                # Fallback: some iLO firmware omits Subject / ValidNotAfter.
                 $pemStr = [string](Get-Prop $cert 'CertificateString')
                 if ((-not $cn -or -not $na) -and $pemStr) {
                     try {
@@ -381,16 +472,32 @@ function Get-SecureBootCertificateInventory {
 
                 $result.Add([pscustomobject]@{
                     Database   = $dbId
-                    CommonName = $cn
+                    CommonName = if ($cn) { $cn.Trim() } else { $null }
                     NotAfter   = $na
                     Serial     = Get-Prop $cert 'SerialNumber'
                 })
             }
-            catch { Write-Verbose "Cannot read $($cm.'@odata.id'): $($_.Exception.Message)" }
+            catch {
+                $failed++
+                Write-Verbose "Cannot read $($cm.'@odata.id'): $($_.Exception.Message)"
+            }
         }
     }
 
-    return $result.ToArray()
+    if ($liveSeen -eq 0) {
+        $notes.Add('SecureBootDatabases lists no live PK/KEK/db/dbx members.')
+        return [pscustomobject]@{ Status = 'NOT_REPORTED'; Note = ($notes -join ' '); Certs = @() }
+    }
+    if ($failed -gt 0) { $notes.Add("$failed certificate read(s) failed.") }
+
+    $status = if ($result.Count -eq 0) { 'EMPTY' } elseif ($failed -gt 0) { 'PARTIAL' } else { 'OK' }
+    return [pscustomobject]@{ Status = $status; Note = ($notes -join ' '); Certs = $result.ToArray() }
+}
+
+function Test-CertIn {
+    <# True when a certificate with this CN is present in the given live database. #>
+    param($Certs, [string]$Database, [string]$CommonName)
+    return [bool](@($Certs | Where-Object { $_.Database -eq $Database -and $_.CommonName -eq $CommonName }).Count -gt 0)
 }
 
 #endregion
@@ -417,12 +524,20 @@ function Get-HPESecureBootStatus {
         SecureBootEnable        = $null
         SecureBootCurrentBoot   = $null
         SecureBootMode          = $null
+        SecureBootActive        = $null
         CertInventory           = 'NotAttempted'
+        CertInventoryNote       = $null
+        DbCounts                = $null
+        Has_PK                  = $null
         Has_KEK2023             = $null
         Has_WindowsUEFICA2023   = $null
         Has_MicrosoftUEFICA2023 = $null
         Has_OptionRomCA2023     = $null
-        Legacy2011Present       = $null
+        Has_VMwareDbCert        = $null
+        Legacy2011InDb          = $null
+        Legacy2011InKEK         = $null
+        Revoked2011InDbx        = $null
+        Missing2023             = $null
         CertDetail              = $null
         Verdict                 = 'Unknown'
         Action                  = $null
@@ -466,44 +581,69 @@ function Get-HPESecureBootStatus {
             else { $row.RomStatus = 'Unknown' }
         }
 
-        # --- Secure Boot state (available on every iLO generation from 5 up) ---
-        $sbUri = "$sysUri/SecureBoot"
-        $sb    = Invoke-Redfish -Uri $sbUri -Headers $conn.Headers -AllowNotFound
+        # --- Secure Boot state ---
+        # Follow the link from the ComputerSystem; never build '$sysUri/SecureBoot' by
+        # string concatenation ($sysUri ends with '/').
+        $sbUri = Resolve-RedfishLink -Conn $conn -Object $sys -Name 'SecureBoot'
+        if (-not $sbUri) { $sbUri = Join-RedfishUri -Base $sysUri -Path 'SecureBoot/' }
+        $sb = Invoke-Redfish -Uri $sbUri -Headers $conn.Headers -AllowNotFound
         if ($sb) {
             foreach ($p in 'SecureBootEnable', 'SecureBootCurrentBoot', 'SecureBootMode') {
                 $row[$p] = Get-Prop $sb $p
             }
+            # Enforcing = currently booted with Secure Boot AND a PK enrolled (UserMode).
+            # Some firmware omits SecureBootMode; then CurrentBoot alone decides.
+            $modeOk = (-not $row.SecureBootMode) -or ($row.SecureBootMode -in 'UserMode', 'DeployedMode')
+            $row.SecureBootActive = [bool](($row.SecureBootCurrentBoot -eq 'Enabled') -and $modeOk)
         }
 
         # --- certificate inventory (iLO 6 / iLO 7 only) ---
-        $certs = $null
-        if ($mgr.ILOGeneration -ge 6) {
-            $certs = Get-SecureBootCertificateInventory -Conn $conn -SecureBootUri $sbUri
+        if ($mgr.ILOGeneration -le 5) {
+            $row.CertInventory = 'UNSUPPORTED_ILO5'
         }
-
-        if ($null -eq $certs) {
-            $row.CertInventory = if ($mgr.ILOGeneration -le 5) { 'UNSUPPORTED_ILO5' } else { 'NOT_REPORTED' }
-        }
-        elseif ($certs.Count -eq 0) {
-            # Field-reported: some iLO 6 units return empty collections.
-            $row.CertInventory = 'EMPTY'
+        elseif (-not $sb) {
+            $row.CertInventory     = 'NOT_REPORTED'
+            $row.CertInventoryNote = "No SecureBoot resource at $sbUri."
         }
         else {
-            $row.CertInventory = 'OK'
-            $cnList = @($certs | Where-Object { $_.CommonName } | ForEach-Object { $_.CommonName.Trim() })
+            $inv = Get-SecureBootCertificateInventory -Conn $conn -SecureBoot $sb -SecureBootUri $sbUri
+            $row.CertInventory     = $inv.Status
+            $row.CertInventoryNote = if ($inv.Note) { $inv.Note } else { $null }
+            $certs = @($inv.Certs)
 
-            $row.Has_KEK2023             = [bool]($cnList -contains 'Microsoft Corporation KEK 2K CA 2023')
-            $row.Has_WindowsUEFICA2023   = [bool]($cnList -contains 'Windows UEFI CA 2023')
-            $row.Has_MicrosoftUEFICA2023 = [bool]($cnList -contains 'Microsoft UEFI CA 2023')
-            $row.Has_OptionRomCA2023     = [bool]($cnList -contains 'Microsoft Option ROM UEFI CA 2023')
-            $row.Legacy2011Present       = [bool](@($cnList | Where-Object { $_ -match '2011' }).Count -gt 0)
+            if ($certs.Count -gt 0) {
+                $row.DbCounts = (@('PK', 'KEK', 'db', 'dbx') | ForEach-Object {
+                    $d = $_; '{0}={1}' -f $d, @($certs | Where-Object { $_.Database -eq $d }).Count
+                }) -join ' '
 
-            $row.CertDetail = ($certs |
-                Sort-Object Database, CommonName |
-                ForEach-Object {
-                    $d = if ($_.NotAfter) { $_.NotAfter.ToString('yyyy-MM-dd') } else { '?' }
-                    "$($_.Database):$($_.CommonName) (exp $d)"
-                }) -join '; '
+                $row.Has_PK                  = [bool](@($certs | Where-Object { $_.Database -eq 'PK' }).Count -gt 0)
+                $row.Has_KEK2023             = Test-CertIn $certs 'KEK' 'Microsoft Corporation KEK 2K CA 2023'
+                $row.Has_WindowsUEFICA2023   = Test-CertIn $certs 'db'  'Windows UEFI CA 2023'
+                $row.Has_MicrosoftUEFICA2023 = Test-CertIn $certs 'db'  'Microsoft UEFI CA 2023'
+                $row.Has_OptionRomCA2023     = Test-CertIn $certs 'db'  'Microsoft Option ROM UEFI CA 2023'
+                # HPE platform defaults carry a VMware signing certificate in db: ESXi boot
+                # does not depend on the Microsoft third-party CA on these platforms.
+                $row.Has_VMwareDbCert        = [bool](@($certs | Where-Object { $_.Database -eq 'db' -and $_.CommonName -match 'VMware' }).Count -gt 0)
+
+                $ms2011 = @($script:CertCatalog | Where-Object { $_.Era -eq 2011 } | ForEach-Object { $_.CN })
+                $row.Legacy2011InDb   = [bool](@($certs | Where-Object { $_.Database -eq 'db'  -and $_.CommonName -in $ms2011 }).Count -gt 0)
+                $row.Legacy2011InKEK  = [bool](@($certs | Where-Object { $_.Database -eq 'KEK' -and $_.CommonName -in $ms2011 }).Count -gt 0)
+                $row.Revoked2011InDbx = [bool](@($certs | Where-Object { $_.Database -eq 'dbx' -and $_.CommonName -in $ms2011 }).Count -gt 0)
+
+                $missing = @()
+                if (-not $row.Has_KEK2023)             { $missing += 'KEK:Microsoft Corporation KEK 2K CA 2023' }
+                if (-not $row.Has_WindowsUEFICA2023)   { $missing += 'db:Windows UEFI CA 2023' }
+                if (-not $row.Has_MicrosoftUEFICA2023) { $missing += 'db:Microsoft UEFI CA 2023' }
+                if (-not $row.Has_OptionRomCA2023)     { $missing += 'db:Microsoft Option ROM UEFI CA 2023' }
+                $row.Missing2023 = if ($missing.Count) { $missing -join '; ' } else { '' }
+
+                $row.CertDetail = ($certs |
+                    Sort-Object Database, CommonName |
+                    ForEach-Object {
+                        $d = if ($_.NotAfter) { $_.NotAfter.ToString('yyyy-MM-dd') } else { '?' }
+                        "$($_.Database):$($_.CommonName) (exp $d)"
+                    }) -join '; '
+            }
         }
 
         $v = @(Get-Verdict -Row $row)
@@ -513,7 +653,7 @@ function Get-HPESecureBootStatus {
     catch {
         $row.Error   = $_.Exception.Message
         $row.Verdict = 'ERROR'
-        $row.Action  = 'Check iLO reachability, credentials and TLS (-SkipCertificateCheck).'
+        $row.Action  = 'Check iLO reachability, credentials and TLS (-SkipCertificateCheck). Details in the Error column.'
     }
     finally {
         Disconnect-ILO -Conn $conn
@@ -531,35 +671,49 @@ function Get-Verdict {
     if ($Row.Generation -in 'Gen10', 'Gen10 Plus') {
         return @('OUT_OF_SCOPE', 'iLO 5 server: the iLO 5 API cannot report Secure Boot certificates, so a remote audit is not possible. See docs/runbook.md.')
     }
-    if ($Row.Generation -eq 'Gen12') {
-        return @('COMPLIANT', 'Gen12 ships with the 2023 certificates included AND enabled. A key reset is NOT required - verify only.')
-    }
 
-    # Readable inventory: hard evidence.
-    if ($Row.CertInventory -eq 'OK') {
-        $missing = @()
-        if (-not $Row.Has_KEK2023)             { $missing += 'KEK 2K CA 2023' }
-        if (-not $Row.Has_WindowsUEFICA2023)   { $missing += 'Windows UEFI CA 2023' }
-        if (-not $Row.Has_MicrosoftUEFICA2023) { $missing += 'Microsoft UEFI CA 2023' }
-        if (-not $Row.Has_OptionRomCA2023)     { $missing += 'Option ROM UEFI CA 2023' }
-
-        if ($missing.Count -eq 0) { return @('COMPLIANT', 'All four 2023 certificates present in the live databases.') }
-
-        if ($Row.RomStatus -eq 'OK') {
-            return @('NEEDS_KEY_RESET', "System ROM meets the baseline but the live databases lack: $($missing -join ', '). Requires 'Reset All Keys to Platform Defaults', then re-enable Secure Boot.")
+    # --- hard evidence: live databases were read (fully or partially) ---
+    if ($Row.CertInventory -in 'OK', 'PARTIAL' -and $null -ne $Row.Missing2023) {
+        if ($Row.Missing2023 -eq '') {
+            # Presence is proven even from a partial read.
+            if ($Row.Has_PK -eq $false -or $Row.SecureBootActive -eq $false) {
+                return @('CERTS_OK_SECUREBOOT_OFF', "All four 2023 certificates present, but Secure Boot is not enforcing (CurrentBoot=$($Row.SecureBootCurrentBoot), Mode=$($Row.SecureBootMode), PK present=$($Row.Has_PK)). Re-enable Secure Boot; if PK is missing, reset all keys to platform defaults first.")
+            }
+            return @('COMPLIANT', 'KEK 2023 in KEK and all three 2023 CAs in db (live databases).')
         }
-        return @('NEEDS_ROM_AND_RESET', "Missing: $($missing -join ', '). Update System ROM to >= $($Row.RomRequired) first, then reset keys.")
+
+        if ($Row.CertInventory -eq 'PARTIAL') {
+            return @(($(if ($Row.Generation -eq 'Gen12') { 'UNVERIFIED' } else { 'ROM_OK_CERTS_UNKNOWN' })),
+                     "Partial read - not found so far: $($Row.Missing2023). $($Row.CertInventoryNote) Re-run with -Verbose.")
+        }
+
+        if ($Row.Generation -eq 'Gen12') {
+            return @('NEEDS_KEY_RESET', "Gen12 ships with the 2023 certificates enabled, yet the live databases lack: $($Row.Missing2023). Keys were customised or replaced. Check dbDefault / KEKDefault, then 'Reset All Keys to Platform Defaults' and re-enable Secure Boot.")
+        }
+        switch ($Row.RomStatus) {
+            'OK' {
+                return @('NEEDS_KEY_RESET', "System ROM meets the baseline but the live databases lack: $($Row.Missing2023). Requires 'Reset All Keys to Platform Defaults', then re-enable Secure Boot.")
+            }
+            'UPDATE_REQUIRED' {
+                return @('NEEDS_ROM_AND_RESET', "Missing: $($Row.Missing2023). Update System ROM to >= $($Row.RomRequired) first, then reset keys.")
+            }
+            default {
+                return @('UNKNOWN', "Missing: $($Row.Missing2023). System ROM status could not be determined - verify manually.")
+            }
+        }
     }
 
-    # Inventory not reported: ROM version is the only signal. It is a necessary but NOT
-    # sufficient condition - a compliant ROM whose keys were never reset still runs on
-    # 2011-only certificates.
+    # --- no inventory: never claim compliance ---
+    $why = if ($Row.CertInventoryNote) { " ($($Row.CertInventoryNote))" } else { '' }
+    if ($Row.Generation -eq 'Gen12') {
+        return @('UNVERIFIED', "Gen12 is expected to carry the 2023 certificates from the factory, but the live databases could not be read$why. Verify in RBSU (Advanced Secure Boot Options > View entries).")
+    }
     switch ($Row.RomStatus) {
         'UPDATE_REQUIRED' {
             return @('NEEDS_ROM_AND_RESET', "System ROM $($Row.RomVersion) is below the required $($Row.RomRequired). Flash the ROM, then reset keys.")
         }
         'OK' {
-            return @('ROM_OK_CERTS_UNKNOWN', "System ROM meets the baseline, but iLO did not report a certificate inventory. Verify via the Embedded UEFI Shell, RBSU, or from inside the OS. If the key reset was never performed, the 2023 certificates are NOT active.")
+            return @('ROM_OK_CERTS_UNKNOWN', "System ROM meets the baseline, but the live databases could not be read$why. If the key reset was never performed, the 2023 certificates are NOT active.")
         }
         default {
             return @('UNKNOWN', 'Could not determine System ROM version or server generation - verify manually.')
@@ -572,10 +726,10 @@ function Get-Verdict {
 #region ------------------------------------------------------------ run
 
 $targets = @(
-    if ($PSCmdlet.ParameterSetName -eq 'File') {
+    $(if ($PSCmdlet.ParameterSetName -eq 'File') {
         Import-Csv -Path $InputCsv | ForEach-Object { $_.ILOHost } | Where-Object { $_ }
     }
-    else { $ILOHost }
+    else { $ILOHost }) | ForEach-Object { ConvertTo-ILOHostName -Value $_ } | Select-Object -Unique
 )
 
 if ($targets.Count -eq 0) { throw 'No targets to audit.' }
@@ -605,13 +759,23 @@ Write-Host ''
 Write-Host '=== Summary ===' -ForegroundColor Cyan
 foreach ($g in ($results | Group-Object Verdict | Sort-Object Count -Descending)) {
     $color = switch ($g.Name) {
-        'COMPLIANT'            { 'Green' }
-        'ROM_OK_CERTS_UNKNOWN' { 'Yellow' }
-        'ERROR'                { 'Red' }
-        'NOT_SUPPORTED'        { 'Red' }
-        default                { 'Yellow' }
+        'COMPLIANT'           { 'Green' }
+        'ERROR'               { 'Red' }
+        'NOT_SUPPORTED'       { 'Red' }
+        'NEEDS_ROM_AND_RESET' { 'Red' }
+        default               { 'Yellow' }
     }
     Write-Host ('{0,-24} {1}' -f $g.Name, $g.Count) -ForegroundColor $color
+}
+
+# Reasons are otherwise hidden by a Format-Table column selection.
+$attention = @($results | Where-Object { $_.Verdict -ne 'COMPLIANT' })
+if ($attention.Count -gt 0) {
+    Write-Host ''
+    foreach ($r in $attention) {
+        $why = if ($r.Error) { $r.Error } elseif ($r.CertInventoryNote) { $r.CertInventoryNote } else { $r.Action }
+        Write-Host ('{0,-22} {1,-24} {2}' -f $r.ILOHost, $r.Verdict, $why) -ForegroundColor DarkYellow
+    }
 }
 Write-Host ''
 

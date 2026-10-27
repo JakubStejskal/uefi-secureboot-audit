@@ -130,8 +130,11 @@ All scripts run on Windows PowerShell 5.1 and PowerShell 7+.
 $cred = Get-Credential
 
 # One or more hosts
-.\scripts\HPE-SecureBootAudit.ps1 -ILOHost ilo-esx01,ilo-esx02 -Credential $cred -SkipCertificateCheck |
-    Format-Table ILOHost,Model,Generation,BiosVersion,RomStatus,CertInventory,Verdict -AutoSize
+$r = .\scripts\HPE-SecureBootAudit.ps1 -ILOHost ilo-esx01,ilo-esx02 -Credential $cred -SkipCertificateCheck
+$r | Format-Table ILOHost,Model,Generation,RomStatus,SecureBootActive,CertInventory,DbCounts,Verdict -AutoSize
+
+# Why a host is not COMPLIANT (reasons are also printed under the summary)
+$r | Where-Object Verdict -ne 'COMPLIANT' | Format-List ILOHost,Verdict,Missing2023,CertInventoryNote,Action,Error
 
 # From a CSV (see examples/fleet.csv)
 .\scripts\HPE-SecureBootAudit.ps1 -InputCsv .\examples\fleet.csv -Credential $cred `
@@ -142,10 +145,13 @@ $cred = Get-Credential
 
 | Verdict | Meaning |
 |---|---|
-| `COMPLIANT` | All four 2023 certificates present, or Gen12 |
-| `NEEDS_KEY_RESET` | ROM meets baseline, live databases still lack 2023 certs |
-| `NEEDS_ROM_AND_RESET` | System ROM below the advisory baseline |
-| `ROM_OK_CERTS_UNKNOWN` | ROM is fine, but iLO did not report a certificate inventory |
+| `COMPLIANT` | Read from the live databases: KEK 2023 in `KEK`, the three 2023 CAs in `db`, Secure Boot enforcing (PK present, UserMode) |
+| `CERTS_OK_SECUREBOOT_OFF` | Certificates complete, but Secure Boot is disabled or the platform is in SetupMode (no PK) |
+| `NEEDS_KEY_RESET` | Live databases lack 2023 certs; ROM meets baseline (Gen11) or is factory-capable (Gen12) |
+| `NEEDS_ROM_AND_RESET` | Live databases lack 2023 certs and System ROM is below the advisory baseline |
+| `ROM_OK_CERTS_UNKNOWN` | Gen11: ROM meets baseline, live databases could not be read (see `CertInventoryNote`) |
+| `UNVERIFIED` | Gen12: live databases could not be read (see `CertInventoryNote`) |
+| `UNKNOWN` | Generation or System ROM version could not be determined |
 | `OUT_OF_SCOPE` | iLO 5 server — no remote audit possible, see [runbook](docs/runbook.md) |
 | `NOT_SUPPORTED` | Gen9 — no firmware path exists |
 | `ERROR` | Unreachable, auth failure, or unexpected response |
@@ -206,7 +212,7 @@ Windows in-guest details, event IDs and Linux guidance are in the [runbook](docs
 
 - **Verify the ROM baselines against the current advisory revision.** HPE revised a00156355en_us five times between January and July 2026. The values here are from rev. 5.
 - **Test the remediation script on a lab server first.** Redfish calls have not been executed against live hardware from this repository; the logic is unit-tested, the wire calls are not.
-- **iLO 7 / Gen12 `SecureBootDatabases` support is inferred**, not confirmed — iLO 7 is a superset of iLO 6, but the iLO 7 changelog does not list it explicitly. Confirm on one live Gen12.
+- **`SecureBootDatabases` is confirmed on live hardware** for both generations (2026-10-27): DL320 Gen11 (iLO 6, System ROM U63 v2.80) and DL380 Gen12 (iLO 7, System ROM U68 v1.52). Both returned PK=1, KEK=3, db=8 certificates including all four 2023 CAs and a `VMware Secure Boot Signing` entry in `db`.
 - **The PCR indices ESXi seals its configuration against are unpublished.** Whether adding 2023 certificates to firmware `db` can break config unsealing on specific hardware is therefore untested. This is the highest-value lab test before a fleet rollout.
 
 ## Known gaps upstream

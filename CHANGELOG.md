@@ -2,6 +2,39 @@
 
 ## [Unreleased]
 
+### Fixed — certificate inventory (v2.1)
+
+- **`CertInventory = NOT_REPORTED` on every iLO 6 / iLO 7 host.** URIs were built by string
+  concatenation from `@odata.id` values that end with `/`, producing
+  `/redfish/v1/Systems/1//SecureBoot/SecureBootDatabases`; the rejection was swallowed as a
+  404. Both HPE scripts now follow the `@odata.id` links iLO returns (`SecureBoot`,
+  `SecureBootDatabases`, `Certificates`, `#SecureBoot.ResetKeys` target) and join paths with
+  exactly one `/`.
+- **Database ID parsed as empty string.** `'.../SecureBootDatabases/db/' -split '/'` ends
+  in `''`, so every live database would have been skipped even with a correct URI. The ID
+  now comes from `DatabaseId`, falling back to the trimmed last path segment.
+- **Gen12 reported `COMPLIANT` without reading any certificate.** Gen12 is now evaluated
+  from the live databases like Gen11; if they cannot be read the verdict is `UNVERIFIED`.
+- **2023 certificates matched in any database.** A CA present only in `dbx` (revoked)
+  counted as present. KEK 2023 is now required in `KEK` and the three CAs in `db`.
+- **`-ILOHost https://10.0.0.5/` failed with `ERROR`.** Scheme, path and trailing slash are
+  stripped; duplicates are removed.
+
+### Added
+
+- Audit columns: `SecureBootActive`, `CertInventoryNote`, `DbCounts`, `Has_PK`,
+  `Has_VMwareDbCert`, `Legacy2011InDb`, `Legacy2011InKEK`, `Revoked2011InDbx`, `Missing2023`.
+- Verdicts `CERTS_OK_SECUREBOOT_OFF` (certificates complete, Secure Boot not enforcing) and
+  `UNVERIFIED` (Gen12, inventory unreadable). Inventory status `PARTIAL`.
+- The summary now prints the reason for every non-compliant host; `Error` was previously
+  hidden by the usual `Format-Table` column selection.
+- Remediation preflight blocks `ResetKeys` when the live KEK and db already hold all four
+  2023 certificates (overridable with `-Force`). `EnableSecureBoot` warns when no PK is
+  enrolled. `Verify` checks each certificate in its own database and reports whether Secure
+  Boot is enforcing. `-WhatIf` no longer claims the key backup was written.
+- `tests/mock-ilo/`: HTTPS Redfish mock reproducing iLO link formatting (trailing `/`,
+  `//` -> 404) with seven scenarios, used to regression-test both HPE scripts.
+
 ### Changed
 
 - **Servers with iLO 5 (Gen10 / Gen10 Plus) are out of scope.** In practice they cannot be
